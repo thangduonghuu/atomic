@@ -1,0 +1,15 @@
+README.md
+pyproject.toml
+atomic/__init__.py
+atomic/config.py
+atomic/llm.py
+atomic/main.py
+atomic/model_picker.py
+atomic/permissions.py
+atomic/tools.py
+atomic.egg-info/PKG-INFO
+atomic.egg-info/SOURCES.txt
+atomic.egg-info/dependency_links.txt
+atomic.egg-info/entry_points.txt
+atomic.egg-info/requires.txt
+atomic.egg-info/top_level.txt

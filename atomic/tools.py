@@ -1,5 +1,5 @@
 import os
-import permissions
+from atomic import permissions
 
 def read_file(path: str) -> str | None:
     real = permissions.resolve(path)

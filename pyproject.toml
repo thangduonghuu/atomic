@@ -1,15 +1,15 @@
 [build-system]
-requires = ["setuptools"]
-build-backend = "setuptools.backends.legacy:build"
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "atomic"
 version = "0.1.0"
 requires-python = ">=3.10"
-dependencies = ["llama-cpp-python"]
+dependencies = ["llama-cpp-python", "rich", "prompt_toolkit"]
 
 [project.scripts]
-atomic = "main:run"
+atomic = "atomic.main:run"
 
-[tool.setuptools]
-py-modules = ["main", "llm", "tools", "permissions"]
+[tool.setuptools.packages.find]
+where = ["."]
