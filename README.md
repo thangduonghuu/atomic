@@ -18,7 +18,7 @@ Local-first CLI coding assistant built on Qwen (GGUF) and llama-cpp-python. Inte
 ## Setup
 
 ```bash
-git clone https://github.com/yourusername/atomic
+git clone https://github.com/thangduonghuu/atomic
 cd atomic
 ```
 
