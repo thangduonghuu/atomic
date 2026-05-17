@@ -21,9 +21,29 @@ def get_model_name() -> str:
     return _model_name
 
 
+def _truncate_messages(messages: list[dict], max_prompt_tokens: int) -> list[dict]:
+    # Always keep system message; drop oldest non-system messages until it fits
+    system = [m for m in messages if m["role"] == "system"]
+    rest = [m for m in messages if m["role"] != "system"]
+    while rest:
+        probe = system + rest
+        try:
+            tokens = _model.tokenize(
+                "\n".join(m["content"] for m in probe).encode(), add_bos=False
+            )
+            if len(tokens) <= max_prompt_tokens:
+                break
+        except Exception:
+            break
+        rest = rest[1:]  # drop oldest non-system message
+    return system + rest
+
+
 def chat(messages: list[dict]) -> dict:
     if _model is None:
         raise RuntimeError("Model not loaded.")
+    max_prompt_tokens = _model.n_ctx() - 2048 - 64  # reserve space for completion + safety
+    messages = _truncate_messages(messages, max_prompt_tokens)
     t0 = time.time()
     response = _model.create_chat_completion(
         messages=messages,

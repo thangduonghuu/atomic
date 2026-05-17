@@ -20,6 +20,11 @@ console = Console()
 
 TOOL_READ = re.compile(r'<read_file\s+path=["\']([^"\']+)["\']')
 TOOL_LIST = re.compile(r'<list_dir\s+path=["\']([^"\']+)["\']')
+CODE_BLOCK = re.compile(r'```(bash|sh|shell|python|py)\n(.*?)```', re.DOTALL)
+
+LANG_NORM = {"sh": "bash", "shell": "bash", "py": "python", "python3": "python"}
+
+_script_session_allowed: bool | None = None  # None=not asked, True=allowed, False=denied
 
 INPUT_STYLE = Style.from_dict({
     "":       "bg:#1c1c1c #e0e0e0",
@@ -74,6 +79,15 @@ TOOLS — output exactly these tags to use them:
   <list_dir path="."/>
   <read_file path="app.py"/>
 
+When suggesting a command or script for the user to run, always wrap it in a fenced code block with the language tag so it can be executed directly:
+  ```bash
+  your command here
+  ```
+  ```python
+  your script here
+  ```
+The user will be prompted to run it and the output will be shown to you.
+
 EXAMPLES:
 User: check this project
 Assistant: <list_dir path="."/>
@@ -81,7 +95,12 @@ Assistant: <list_dir path="."/>
 User: what's in main.py?
 Assistant: <read_file path="main.py"/>
 
-After receiving file contents, give your review. Never say you cannot access the filesystem."""
+User: how much disk space is left?
+Assistant: ```bash
+df -h .
+```
+
+After receiving file contents or script output, give your analysis. Never say you cannot access the filesystem."""
 
 
 def make_history() -> list[dict]:
@@ -120,6 +139,50 @@ def process_tool_calls(response: str, history: list[dict]) -> tuple[str, dict]:
         stats = result
 
     return response, stats
+
+
+def _print_script(lang: str, code: str):
+    console.print(f"\n  [cyan bold]▶ {lang}[/cyan bold]")
+    for line in code.splitlines():
+        console.print(f"  [dim]│[/dim] {line}")
+
+
+def _run_with_autofix(code: str, lang: str, history: list[dict], max_retries: int = 3):
+    for attempt in range(max_retries):
+        console.print("  [dim]running...[/dim]", end="\r")
+        result = tools.run_script(code, lang)
+        console.print("           \r", end="")
+
+        if result["ok"]:
+            console.print(f"  [green]✓ output:[/green]\n{result['output']}\n")
+            history.append({"role": "user", "content": f"Script ran successfully. Output:\n```\n{result['output']}\n```"})
+            return
+
+        console.print(f"  [red]✗ error (exit {result['returncode']}):[/red]\n{result['output']}\n")
+
+        if attempt == max_retries - 1:
+            history.append({"role": "user", "content": f"Script failed:\n```\n{result['output']}\n```"})
+            return
+
+        console.print("  [dim]asking AI to fix...[/dim]", end="\r")
+        history.append({"role": "user", "content": (
+            f"Script failed (exit {result['returncode']}):\n```\n{result['output']}\n```\n"
+            f"Fix the script and provide only the corrected version."
+        )})
+        fix_result = llm.chat(history)
+        fix_reply = fix_result["content"]
+        console.print("           \r", end="")
+        console.print(Markdown(fix_reply))
+        history.append({"role": "assistant", "content": fix_reply})
+
+        fix_match = CODE_BLOCK.search(fix_reply)
+        if not fix_match:
+            return
+
+        lang = LANG_NORM.get(fix_match.group(1), fix_match.group(1))
+        code = fix_match.group(2).strip()
+        console.print(f"  [yellow]retrying (attempt {attempt + 2}/{max_retries})...[/yellow]")
+        _print_script(lang, code)
 
 
 def run():
@@ -196,6 +259,26 @@ def run():
         console.print(f"\n[dim]  ⏱ {elapsed:.1f}s · {total} tokens · {tps:.0f} tok/s[/dim]")
 
         history.append({"role": "assistant", "content": reply})
+
+        for match in CODE_BLOCK.finditer(reply):
+            global _script_session_allowed
+            lang = LANG_NORM.get(match.group(1), match.group(1))
+            code = match.group(2).strip()
+
+            _print_script(lang, code)
+
+            if _script_session_allowed is None:
+                console.print("\n  [yellow]Run scripts automatically this session?[/yellow] [dim]([y]es / [n]o)[/dim]")
+                try:
+                    answer = input("  > ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    break
+                _script_session_allowed = answer in ("y", "yes")
+
+            if not _script_session_allowed:
+                continue
+
+            _run_with_autofix(code, lang, history)
 
 
 if __name__ == "__main__":

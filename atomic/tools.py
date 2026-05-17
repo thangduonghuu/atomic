@@ -1,5 +1,23 @@
 import os
+import subprocess
 from atomic import permissions
+
+def run_script(code: str, lang: str = "bash") -> dict:
+    """Returns {"output": str, "ok": bool, "returncode": int}."""
+    if lang in ("bash", "sh", "shell"):
+        cmd = ["bash", "-c", code]
+    elif lang in ("python", "py", "python3"):
+        cmd = ["python3", "-c", code]
+    else:
+        return {"output": f"[unsupported language: {lang}]", "ok": False, "returncode": -1}
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=os.getcwd())
+        output = (r.stdout + r.stderr).strip() or "(no output)"
+        return {"output": output, "ok": r.returncode == 0, "returncode": r.returncode}
+    except subprocess.TimeoutExpired:
+        return {"output": "[error] script timed out after 30s", "ok": False, "returncode": -1}
+    except Exception as e:
+        return {"output": f"[error] {e}", "ok": False, "returncode": -1}
 
 def read_file(path: str) -> str | None:
     real = permissions.resolve(path)
