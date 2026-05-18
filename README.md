@@ -5,8 +5,11 @@ Local-first CLI coding assistant powered by any GGUF model via llama-cpp-python.
 ## Features
 
 - **Fully offline** — runs entirely on your machine using a local GGUF model
-- **Agentic** — model can list directories and read files autonomously to answer your questions
-- **Script execution** — model can suggest and run bash/python scripts; failed scripts are auto-fixed and retried (up to 3 attempts)
+- **Agentic** — model can list directories, read files, and write files autonomously
+- **Smart script execution** — model runs bash/python commands; failed scripts are auto-fixed and retried (up to 3 attempts)
+- **Server detection** — long-running processes (dev servers, watchers) are automatically detected and shown as manual commands instead of blocking the session
+- **Inactivity-based timeout** — scripts run as long as they produce output; killed only after 10s of silence (servers) or 60s with no output at all (stuck)
+- **Interruptible** — Ctrl+C stops thinking or a running script without killing the session; Ctrl+D to exit
 - **Context-aware** — injects current directory listing automatically so you can say "review my code" without specifying paths
 - **Model management** — download models from HuggingFace, register local files, switch models mid-session
 - **Context window safety** — automatically truncates history to fit within the model's context window
@@ -63,6 +66,23 @@ atomic help                   Show help
 | `/model` | Switch model mid-session |
 | `/clear` | Reset conversation history |
 | `/exit` or `/quit` | Quit |
+
+## Keyboard Shortcuts
+
+| Key | During input | During thinking | During script |
+|---|---|---|---|
+| `Ctrl+C` | Clear current line | Stop generation | Kill script |
+| `Ctrl+D` | Exit app | — | — |
+| `Enter` | Submit | — | — |
+
+## Script Execution
+
+The model uses two code block types to distinguish one-time commands from servers:
+
+- ` ```bash ` — auto-executed (install, build, scaffold, test)
+- ` ```bash-server ` — displayed only, not auto-run (dev servers, watchers)
+
+If the model mistakenly puts a server command in a `bash` block, atomic detects it at runtime: if the process produces output then goes silent for 10 seconds while still running, it is killed and flagged as a server command.
 
 ## Project Structure
 

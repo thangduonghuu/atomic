@@ -2,128 +2,118 @@
 import os
 import re
 import sys
+import queue
 import shutil
+import readline  # noqa: F401 — enables arrow keys, history, backspace via input()
 import threading
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.rule import Rule
-from prompt_toolkit import Application
-from prompt_toolkit.buffer import Buffer
-from prompt_toolkit.layout import Layout
-from prompt_toolkit.layout.containers import HSplit, Window
-from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.styles import Style
 
 from atomic import llm, tools, model_picker
 
 console = Console()
 
-TOOL_READ = re.compile(r'<read_file\s+path=["\']([^"\']+)["\']')
-TOOL_LIST = re.compile(r'<list_dir\s+path=["\']([^"\']+)["\']')
-CODE_BLOCK = re.compile(r'```(bash|sh|shell|python|py)\n(.*?)```', re.DOTALL)
+TOOL_READ  = re.compile(r'<read_file\s+path=["\']([^"\']+)["\']')
+TOOL_LIST  = re.compile(r'<list_dir\s+path=["\']([^"\']+)["\']')
+TOOL_WRITE = re.compile(r'<write_file\s+path=["\']([^"\']+)["\']\s*>(.*?)</write_file>', re.DOTALL)
+CODE_BLOCK = re.compile(r'```(bash|sh|shell|python|py|bash-server)\n(.*?)```', re.DOTALL)
 THINK_BLOCK = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 
 LANG_NORM = {"sh": "bash", "shell": "bash", "py": "python", "python3": "python"}
 
 _script_session_allowed: bool | None = None  # None=not asked, True=allowed, False=denied
+_server_queue: queue.Queue = queue.Queue()
 
 
-INPUT_STYLE = Style.from_dict({
-    "":       "bg:#1c1c1c #e0e0e0",
-    "prompt": "bg:#1c1c1c #00d7ff bold",
-})
+def _server_print(line: str) -> None:
+    _server_queue.put(line)
+
+
+def _flush_server_output() -> None:
+    lines = []
+    try:
+        while True:
+            lines.append(_server_queue.get_nowait())
+    except queue.Empty:
+        pass
+    for line in lines:
+        console.print(f"  [dim]│[/dim] [cyan][srv][/cyan] {line}")
+
 
 def get_input() -> str:
-    result = [None]
-    buf = Buffer()
-    kb = KeyBindings()
-
-    @kb.add("enter")
-    def submit(event):
-        result[0] = buf.text
-        event.app.exit()
-
-    @kb.add("c-c")
-    def cancel(event):
-        event.app.exit(exception=KeyboardInterrupt)
-
-    @kb.add("c-d")
-    def eof(event):
-        event.app.exit(exception=EOFError)
-
     w = shutil.get_terminal_size().columns
-    border = [("fg:#444444", "─" * w)]
+    border = f"[dim]{'─' * w}[/dim]"
+    console.print(border)
+    try:
+        line = input(" > ")
+    except KeyboardInterrupt:
+        print()
+        raise
+    console.print(border)
+    return line.strip()
 
-    layout = Layout(
-        HSplit([
-            Window(FormattedTextControl(border), height=1),
-            Window(
-                BufferControl(buffer=buf),
-                height=1,
-                style="class:",
-                get_line_prefix=lambda lineno, wrap_count: [("class:prompt", " > ")],
-            ),
-            Window(FormattedTextControl(border), height=1),
-        ])
-    )
-
-    app = Application(layout=layout, key_bindings=kb, style=INPUT_STYLE, full_screen=False, erase_when_done=True)
-    app.run()
-    return (result[0] or "").strip()
 
 
 SYSTEM_PROMPT = """You are a local coding assistant with direct filesystem access on this machine.
 Current working directory: {cwd}
 
-IMPORTANT: You CAN and MUST read files using these tools. Never say you cannot access files.
+You have the following tools. Use them freely — never say you cannot access files.
 
-TOOLS — output exactly these tags to use them:
-  <list_dir path="."/>
-  <read_file path="app.py"/>
+TOOLS:
 
-When suggesting commands or scripts, wrap them in fenced code blocks with the language tag so they can be executed directly.
+1. List a directory:
+   <list_dir path="."/>
 
-CRITICAL RULES for bash scripts:
-- ALWAYS put ALL related commands in a SINGLE bash block. Each bash block runs as an independent subprocess — cd commands do NOT persist between blocks.
-- WRONG (cd lost between blocks):
-  ```bash
-  cd myproject
-  ```
-  ```bash
-  npm install
-  ```
-- CORRECT (everything in one block):
-  ```bash
-  cd myproject && npm install && npm run build
-  ```
-- When creating a project and writing files, do it all in one bash block using heredocs.
-  ALWAYS create ALL subdirectories before writing files into them:
-  ```bash
-  mkdir -p myapp/src myapp/public && cd myapp
-  cat > src/App.jsx << 'EOF'
-  // your code here
-  EOF
-  cat > public/index.html << 'EOF'
-  <!-- html here -->
-  EOF
-  npm install
-  ```
+2. Read a file:
+   <read_file path="src/app.py"/>
+
+3. Write (create or overwrite) a file — use this instead of bash heredocs:
+   <write_file path="src/app.py">
+   full file content here
+   </write_file>
+
+4. Run a one-time shell command (auto-executed — must exit on its own):
+   ```bash
+   command here
+   ```
+   Each bash block is an independent subprocess. Chain commands with && if order matters.
+
+5. Show a long-running command the user must start manually (NOT auto-executed):
+   ```bash-server
+   command here
+   ```
+   Use this for anything that runs forever: dev servers, watchers, repls, etc.
+   The system will display it but tell the user to run it in a separate terminal.
+
+WORKFLOW:
+- Explore with <list_dir> and <read_file> to understand the codebase.
+- Create or edit files with <write_file>.
+- Use ```bash``` for install, build, test, scaffold — commands that finish and exit.
+- Use ```bash-server``` for start/serve/watch commands that stay running.
+- After each tool result, continue until the task is complete.
 
 EXAMPLES:
-User: check this project
+User: what files are here?
 Assistant: <list_dir path="."/>
 
-User: what's in main.py?
+User: show me main.py
 Assistant: <read_file path="main.py"/>
 
-User: how much disk space is left?
-Assistant: ```bash
-df -h .
-```
+User: create a hello world script
+Assistant: <write_file path="hello.py">
+print("Hello, world!")
+</write_file>
 
-After receiving file contents or script output, give your analysis. Never say you cannot access the filesystem."""
+User: set up a react app with vite
+Assistant: ```bash
+npm create vite@latest . -- --template react && npm install
+```
+Now start the dev server:
+```bash-server
+npm run dev
+```"""
 
 
 def make_history() -> list[dict]:
@@ -152,6 +142,11 @@ def process_tool_calls(response: str, history: list[dict]) -> tuple[str, dict]:
             else:
                 tool_results.append(f"Could not read {path}.")
 
+        for path, content in TOOL_WRITE.findall(response):
+            console.print(f"  [dim]⚙ writing {path}[/dim]")
+            result_msg = tools.write_file(path, content.lstrip("\n"))
+            tool_results.append(result_msg)
+
         if not tool_results:
             return response, stats
 
@@ -170,31 +165,52 @@ def _print_script(lang: str, code: str):
         console.print(f"  [dim]│[/dim] {line}")
 
 
-def _run_with_autofix(code: str, lang: str, history: list[dict], max_retries: int = 3):
+def _run_with_autofix(code: str, lang: str, history: list[dict], max_retries: int = 3) -> bool:
+    """Returns True if a follow-up model response is needed, False otherwise."""
     for attempt in range(max_retries):
         output_lines = []
-        with Live("  [dim]running...[/dim]", console=console, refresh_per_second=15, transient=False) as live:
-            def on_line(line: str):
-                output_lines.append(line)
-                display = "\n".join(f"  [dim]│[/dim] {l}" for l in output_lines[-20:])
-                live.update(display)
-            result = tools.run_script(code, lang, on_line=on_line)
+        import time as _time
+        start = _time.monotonic()
 
+        try:
+            with Live("  [dim]running...[/dim]", console=console, refresh_per_second=15, transient=False) as live:
+                def on_line(line: str):
+                    output_lines.append(line)
+                    elapsed = _time.monotonic() - start
+                    timer = f"[dim]{elapsed:.1f}s[/dim]"
+                    body = "\n".join(f"  [dim]│[/dim] {l}" for l in output_lines[-20:])
+                    live.update(f"  {timer}\n{body}")
+                result = tools.run_script(code, lang, on_line=on_line)
+        except KeyboardInterrupt:
+            console.print("\n  [dim]interrupted[/dim]\n")
+            return False
+
+        elapsed = _time.monotonic() - start
         if result["ok"]:
-            console.print(f"  [green]✓ done[/green]\n")
+            console.print(f"  [green]✓ done[/green]  [dim]{elapsed:.1f}s[/dim]\n")
             history.append({"role": "user", "content": f"Script ran successfully. Output:\n```\n{result['output']}\n```"})
-            return
+            return True
+
+        if result.get("is_server"):
+            console.print(f"  [cyan]⚙ server detected, starting in background...[/cyan]  [dim]{elapsed:.1f}s[/dim]\n")
+            tools.run_server_background(code, on_line=_server_print)
+            return False
 
         console.print(f"  [red]✗ error (exit {result['returncode']}):[/red]\n{result['output']}\n")
 
         if attempt == max_retries - 1:
             history.append({"role": "user", "content": f"Script failed:\n```\n{result['output']}\n```"})
-            return
+            return True
 
         console.print("  [dim]asking AI to fix...[/dim]", end="\r")
         history.append({"role": "user", "content": (
-            f"Script failed (exit {result['returncode']}):\n```\n{result['output']}\n```\n"
-            f"Fix the script and provide only the corrected version."
+            f"The following {lang} script exited with code {result['returncode']}:\n"
+            f"```{lang}\n{code}\n```\n"
+            f"Output:\n```\n{result['output']}\n```\n"
+            f"Note: if exit code 1 came from grep/find finding no results, that may mean the "
+            f"previous step succeeded — in that case, rewrite without the grep verification, "
+            f"or use `|| true` to suppress the exit code. Otherwise fix the real error. "
+            f"Provide only the corrected script."
         )})
         fix_result = llm.chat(history)
         fix_reply = fix_result["content"]
@@ -204,12 +220,13 @@ def _run_with_autofix(code: str, lang: str, history: list[dict], max_retries: in
 
         fix_match = CODE_BLOCK.search(fix_reply)
         if not fix_match:
-            return
+            return True
 
         lang = LANG_NORM.get(fix_match.group(1), fix_match.group(1))
         code = fix_match.group(2).strip()
         console.print(f"  [yellow]retrying (attempt {attempt + 2}/{max_retries})...[/yellow]")
         _print_script(lang, code)
+    return True
 
 
 def _is_truncated(text: str) -> bool:
@@ -228,6 +245,10 @@ def _stream_chat(history: list[dict]) -> tuple[str, dict] | tuple[None, None]:
             buffer.append(t)
         try:
             result = llm.chat(history, on_token=on_token)
+        except KeyboardInterrupt:
+            llm.stop()
+            console.print("\n  [dim]interrupted[/dim]")
+            return None, None
         except Exception as e:
             error = e
         finally:
@@ -290,13 +311,17 @@ def run():
     history = make_history()
 
     while True:
+        _flush_server_output()
         try:
             user_input = get_input()
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
             llm.stop()
             console.print("\n[dim]bye.[/dim]")
             break
+        except KeyboardInterrupt:
+            continue
 
+        _flush_server_output()
         if not user_input:
             continue
 
@@ -304,6 +329,13 @@ def run():
             llm.stop()
             console.print("[dim]bye.[/dim]")
             break
+
+        if user_input == "/server":
+            if tools.stop_server_background():
+                console.print("  [dim]server stopped[/dim]\n")
+            else:
+                console.print("  [dim]no server running[/dim]\n")
+            continue
 
         if user_input == "/clear":
             console.clear()
@@ -338,32 +370,45 @@ def run():
 
         history.append({"role": "assistant", "content": reply})
 
-        scripts_ran = False
-        for match in CODE_BLOCK.finditer(reply):
-            global _script_session_allowed
-            lang = LANG_NORM.get(match.group(1), match.group(1))
-            code = match.group(2).strip()
+        while True:
+            scripts_ran = False
+            for match in CODE_BLOCK.finditer(reply):
+                global _script_session_allowed
+                raw_lang = match.group(1)
+                lang = LANG_NORM.get(raw_lang, raw_lang)
+                code = match.group(2).strip()
 
-            _print_script(lang, code)
+                if raw_lang == "bash-server":
+                    _print_script("bash", code)
+                    tools.run_server_background(code, on_line=_server_print)
+                    console.print("  [cyan]↑ server started in background  (Ctrl+C or /server to stop)[/cyan]\n")
+                    history.append({"role": "user", "content": "Server is now running in the background. Output is streaming to the terminal."})
+                    continue
 
-            if _script_session_allowed is None:
-                console.print("\n  [yellow]Run scripts automatically this session?[/yellow] [dim](y / n)[/dim]")
-                try:
-                    answer = input("  > ").strip().lower()
-                except (EOFError, KeyboardInterrupt):
-                    break
-                _script_session_allowed = answer in ("y", "yes")
+                _print_script(lang, code)
 
-            if not _script_session_allowed:
-                continue
+                if _script_session_allowed is None:
+                    console.print("\n  [yellow]Run scripts automatically this session?[/yellow] [dim](y / n)[/dim]")
+                    try:
+                        answer = input("  > ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        break
+                    _script_session_allowed = answer in ("y", "yes")
 
-            _run_with_autofix(code, lang, history)
-            scripts_ran = True
+                if not _script_session_allowed:
+                    continue
 
-        if scripts_ran:
-            follow_up = _respond(history)
-            if follow_up:
-                history.append({"role": "assistant", "content": follow_up})
+                needs_followup = _run_with_autofix(code, lang, history)
+                if needs_followup:
+                    scripts_ran = True
+
+            if not scripts_ran:
+                break
+
+            reply = _respond(history)
+            if reply is None:
+                break
+            history.append({"role": "assistant", "content": reply})
 
 
 
