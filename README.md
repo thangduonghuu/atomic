@@ -5,56 +5,98 @@ Local-first CLI coding assistant powered by any GGUF model via llama-cpp-python.
 ## Features
 
 - **Fully offline** — runs entirely on your machine using a local GGUF model
-- **Agentic** — model can list directories, read files, and write files autonomously
-- **Smart script execution** — model runs bash/python commands; failed scripts are auto-fixed and retried (up to 3 attempts)
-- **Server detection** — long-running processes (dev servers, watchers) are automatically detected and shown as manual commands instead of blocking the session
-- **Inactivity-based timeout** — scripts run as long as they produce output; killed only after 10s of silence (servers) or 60s with no output at all (stuck)
-- **Interruptible** — Ctrl+C stops thinking or a running script without killing the session; Ctrl+D to exit
-- **Context-aware** — injects current directory listing automatically so you can say "review my code" without specifying paths
-- **Model management** — download models from HuggingFace, register local files, switch models mid-session
-- **Context window safety** — automatically truncates history to fit within the model's context window
+- **Agentic** — reads files, lists directories, writes files, runs scripts autonomously
+- **Smart script execution** — auto-runs bash/python commands; failed scripts are auto-fixed and retried (up to 3 attempts)
+- **Background server** — dev servers run in the background, output streams to terminal, chat stays usable
+- **Server detection** — if a server accidentally lands in a `bash` block, atomic detects and moves it to background automatically
+- **Inactivity timeout** — scripts killed after 5s of silence if still running (server), or 60s if no output at all (stuck)
+- **Interruptible** — Ctrl+C stops thinking or a running script without exiting; Ctrl+D to quit
+- **Context-aware** — injects current directory listing so you can say "review my code" without specifying paths
+- **Model management** — download from HuggingFace, register local files, switch models mid-session
 
-## Requirements
-
-- Python 3.10+
-- A GGUF model (e.g. `qwen2.5-coder-7b-instruct-q4_k_m.gguf`)
-- [llama-cpp-python](https://github.com/abetlen/llama-cpp-python)
+---
 
 ## Setup
+
+### 1. Clone the repo
 
 ```bash
 git clone https://github.com/thangduonghuu/atomic
 cd atomic
 ```
 
-**Mac (Metal GPU acceleration):**
+### 2. Create a virtual environment (recommended)
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+### 3. Install llama-cpp-python
+
+**Mac — Metal GPU acceleration:**
 ```bash
 CMAKE_ARGS="-DGGML_METAL=on" pip install llama-cpp-python
-pip install -e .
 ```
 
-**Without GPU:**
+**Linux — CUDA:**
+```bash
+CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python
+```
+
+**CPU only:**
 ```bash
 pip install llama-cpp-python
+```
+
+### 4. Install atomic
+
+```bash
 pip install -e .
 ```
 
-On first run, atomic will prompt you to select or download a model. The choice is saved as default for future runs.
+---
 
-## Usage
+## Download a model
+
+**Interactive (recommended):**
+```bash
+atomic model download
+```
+This opens an interactive prompt to search and download any GGUF model from HuggingFace.
+
+**Direct repo:**
+```bash
+atomic model download Qwen/Qwen2.5-Coder-7B-Instruct-GGUF
+```
+
+**Register a model you already have:**
+```bash
+atomic model add ~/models/qwen2.5-coder-7b-instruct-q4_k_m.gguf
+```
+
+The selected model is saved as default for future runs.
+
+---
+
+## Run
 
 ```bash
 atomic
 ```
 
+On first run, atomic prompts you to pick or download a model.
+
+---
+
 ## CLI Commands
 
 ```
-atomic                        Start chat with default model
+atomic                        Start chat
 atomic model                  Re-select default model
-atomic model list             List registered models
+atomic model list             List available models
 atomic model add <path>       Register a local .gguf file
-atomic model download [repo]  Download a model from HuggingFace
+atomic model download [repo]  Download from HuggingFace
 atomic help                   Show help
 ```
 
@@ -64,25 +106,34 @@ atomic help                   Show help
 |---|---|
 | `/read <path>` | Load a file into context |
 | `/model` | Switch model mid-session |
+| `/server` | Stop the background server |
 | `/clear` | Reset conversation history |
 | `/exit` or `/quit` | Quit |
 
 ## Keyboard Shortcuts
 
-| Key | During input | During thinking | During script |
-|---|---|---|---|
-| `Ctrl+C` | Clear current line | Stop generation | Kill script |
-| `Ctrl+D` | Exit app | — | — |
-| `Enter` | Submit | — | — |
+| Key | Effect |
+|---|---|
+| `Enter` | Submit message |
+| `Ctrl+C` | Cancel current input / interrupt thinking / kill running script |
+| `Ctrl+D` | Exit app |
 
-## Script Execution
+---
 
-The model uses two code block types to distinguish one-time commands from servers:
+## How script execution works
 
-- ` ```bash ` — auto-executed (install, build, scaffold, test)
-- ` ```bash-server ` — displayed only, not auto-run (dev servers, watchers)
+The model uses two block types:
 
-If the model mistakenly puts a server command in a `bash` block, atomic detects it at runtime: if the process produces output then goes silent for 10 seconds while still running, it is killed and flagged as a server command.
+| Block | Behaviour |
+|---|---|
+| ` ```bash ` | Auto-executed — one-time commands (install, build, test, scaffold) |
+| ` ```bash-server ` | Starts in background — dev servers, watchers, long-running processes |
+
+If the model puts a server command in a `bash` block, atomic detects it at runtime (goes silent for 5s while still running) and moves it to background automatically.
+
+Server output streams to the terminal prefixed with `│ [srv]`. Use `/server` to stop it.
+
+---
 
 ## Project Structure
 
@@ -90,7 +141,7 @@ If the model mistakenly puts a server command in a `bash` block, atomic detects 
 atomic/
 ├── main.py          # CLI entry, chat loop, script execution
 ├── llm.py           # llama-cpp-python wrapper, context truncation
-├── tools.py         # read_file, list_dir, run_script
+├── tools.py         # read_file, list_dir, run_script, background server
 ├── permissions.py   # file access permission gate
 ├── model_picker.py  # interactive model selection
 ├── download.py      # HuggingFace model downloader
