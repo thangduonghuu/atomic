@@ -4,7 +4,7 @@ import os
 CONFIG_DIR = os.path.expanduser("~/.atomic")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
-SEARCH_DIRS = [
+DEFAULT_SEARCH_DIRS = [
     "~/models",
     "~/Downloads",
     "~/.ollama/models",
@@ -38,8 +38,10 @@ def set_default(model_path: str):
 
 
 def find_gguf_files() -> list[str]:
+    cfg = load()
+    dirs = cfg.get("search_dirs", DEFAULT_SEARCH_DIRS)
     found = []
-    for d in SEARCH_DIRS:
+    for d in dirs:
         d = os.path.expanduser(d)
         if not os.path.isdir(d):
             continue

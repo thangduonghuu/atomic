@@ -1,6 +1,9 @@
 import os
+from rich.console import Console
 
 _allowed: set[str] = set()
+console = Console()
+
 
 def resolve(path: str) -> str:
     return os.path.realpath(os.path.expanduser(path))
@@ -10,7 +13,7 @@ def is_allowed(path: str) -> bool:
 
 def ask(path: str) -> bool:
     real = resolve(path)
-    print(f"\n  [permission] Allow reading: {real}")
+    console.print(f"\n  [yellow][permission][/yellow] Allow reading: {real}")
     answer = input("  [y]es / [n]o / [a]lways this session: ").strip().lower()
     if answer in ("a", "always"):
         _allowed.add(real)

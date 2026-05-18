@@ -2,6 +2,7 @@
 import os
 import re
 import sys
+import time
 import queue
 import shutil
 import readline  # noqa: F401 — enables arrow keys, history, backspace via input()
@@ -10,6 +11,7 @@ from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.rule import Rule
+from rich.text import Text
 
 from atomic import llm, tools, model_picker
 
@@ -230,19 +232,27 @@ def _run_with_autofix(code: str, lang: str, history: list[dict], max_retries: in
 
 
 def _is_truncated(text: str) -> bool:
-    """Detect obvious truncation: unclosed code block."""
-    return text.count("```") % 2 != 0
+    if text.count("```") % 2 != 0:
+        return True
+    for tag in ("read_file", "write_file", "list_dir"):
+        if text.count(f"<{tag}") > text.count(f"</{tag}>"):
+            return True
+    return False
 
 
 def _stream_chat(history: list[dict]) -> tuple[str, dict] | tuple[None, None]:
-    buffer = []
-    done = threading.Event()
-
+    text_parts: list[str] = []
     error = None
     result = None
-    with Live("[dim]thinking...[/dim]", console=console, refresh_per_second=4, transient=True) as live:
+
+    with Live("[dim]thinking...[/dim]", console=console, refresh_per_second=12, transient=True) as live:
         def on_token(t: str):
-            buffer.append(t)
+            text_parts.append(t)
+            current = "".join(text_parts)
+            lines = current.splitlines()
+            display = "\n".join(lines[-25:])
+            live.update(Text(display))
+
         try:
             result = llm.chat(history, on_token=on_token)
         except KeyboardInterrupt:
@@ -251,8 +261,6 @@ def _stream_chat(history: list[dict]) -> tuple[str, dict] | tuple[None, None]:
             return None, None
         except Exception as e:
             error = e
-        finally:
-            done.set()
 
     if error:
         console.print(f"  [red]error: {error}[/red]")
@@ -296,11 +304,30 @@ def _respond(history: list[dict]) -> str | None:
         console.print(f"\n[dim]  ◦ thought for ~{think_tokens} words[/dim]\n")
 
     console.print(Markdown(reply))
-    console.print(f"\n[dim]  ⏱ {elapsed:.1f}s · {comp} tok · {tps:.0f} tok/s[/dim]")
+    ctx_used, ctx_max = llm.estimate_context_usage(history)
+    ctx_info = f"  ctx {ctx_used:,}/{ctx_max:,}" if ctx_max else ""
+    console.print(f"\n[dim]  ⏱ {elapsed:.1f}s · {comp} tok · {tps:.0f} tok/s{ctx_info}[/dim]")
     return reply
 
 
+def _save_conversation(history: list[dict], path: str) -> None:
+    lines = [f"# atomic session — {time.strftime('%Y-%m-%d %H:%M')}\n"]
+    for msg in history:
+        if msg["role"] == "system":
+            continue
+        lines.append(f"\n## {msg['role'].capitalize()}\n")
+        lines.append(msg["content"])
+        lines.append("\n")
+    try:
+        with open(path, "w") as f:
+            f.write("\n".join(lines))
+        console.print(f"  [green]Saved to {path}[/green]\n")
+    except Exception as e:
+        console.print(f"  [red]Failed to save: {e}[/red]\n")
+
+
 def run():
+    global _script_session_allowed
     model_path = model_picker.pick_model()
     console.print(f"\n  [dim]Loading model...[/dim]", end="\r")
     llm.load_model(model_path)
@@ -341,6 +368,27 @@ def run():
             console.clear()
             console.print(Rule(f"[cyan]atomic[/cyan]  [dim]{model_name}[/dim]"))
             history = make_history()
+            _script_session_allowed = None
+            continue
+
+        if user_input == "/help":
+            console.print("""
+  [bold]Commands:[/bold]
+
+  [cyan]/read <path>[/cyan]     Load a file into context
+  [cyan]/model[/cyan]           Switch model mid-session
+  [cyan]/server[/cyan]          Stop the background server
+  [cyan]/save [path][/cyan]     Save conversation to a markdown file
+  [cyan]/clear[/cyan]           Reset conversation history
+  [cyan]/help[/cyan]            Show this help
+  [cyan]/exit[/cyan], [cyan]/quit[/cyan]   Exit
+""")
+            continue
+
+        if user_input.startswith("/save"):
+            parts = user_input.split(None, 1)
+            save_path = parts[1].strip() if len(parts) > 1 else f"atomic-{int(time.time())}.md"
+            _save_conversation(history, save_path)
             continue
 
         if user_input == "/model":
@@ -373,7 +421,6 @@ def run():
         while True:
             scripts_ran = False
             for match in CODE_BLOCK.finditer(reply):
-                global _script_session_allowed
                 raw_lang = match.group(1)
                 lang = LANG_NORM.get(raw_lang, raw_lang)
                 code = match.group(2).strip()

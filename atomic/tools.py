@@ -2,7 +2,20 @@ import os
 import signal
 import subprocess
 import threading
+from rich.console import Console
 from atomic import permissions
+
+console = Console()
+
+_MAX_FILE_BYTES = 512 * 1024  # 512 KB
+
+
+def _fmt_size(n: int) -> str:
+    if n < 1024:
+        return f"{n}B"
+    if n < 1024 ** 2:
+        return f"{n / 1024:.1f}K"
+    return f"{n / 1024 ** 2:.1f}M"
 
 # After producing some output, if the process goes silent for this long while
 # still running, it is almost certainly a server — kill it and surface as such.
@@ -144,21 +157,37 @@ def read_file(path: str) -> str | None:
     real = permissions.resolve(path)
 
     if not os.path.exists(real):
-        print(f"  [error] File not found: {real}")
+        console.print(f"  [red][error][/red] File not found: {real}")
+        return None
+
+    size = os.path.getsize(real)
+    if size > _MAX_FILE_BYTES:
+        console.print(f"  [yellow]⚠ {path} is {_fmt_size(size)} — too large to read into context[/yellow]")
         return None
 
     if not permissions.is_allowed(real):
         if not permissions.ask(real):
-            print("  [denied] File access denied.")
+            console.print("  [dim][denied] File access denied.[/dim]")
             return None
 
     with open(real, "r", errors="replace") as f:
         return f.read()
 
+
 def list_dir(path: str = ".") -> str:
     real = permissions.resolve(path)
     try:
-        entries = os.listdir(real)
-        return "\n".join(sorted(entries))
+        entries = sorted(os.listdir(real))
+        lines = []
+        for name in entries:
+            full = os.path.join(real, name)
+            if os.path.isdir(full):
+                lines.append(name + "/")
+            else:
+                try:
+                    lines.append(f"{name}  ({_fmt_size(os.path.getsize(full))})")
+                except OSError:
+                    lines.append(name)
+        return "\n".join(lines)
     except PermissionError:
         return "[error] Permission denied."

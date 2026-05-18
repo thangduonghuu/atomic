@@ -1,8 +1,10 @@
 import time
+import threading
 from llama_cpp import Llama
 
 _model = None
 _model_name = ""
+_stop_event = threading.Event()
 
 
 def load_model(model_path: str, n_ctx: int = 32768, n_gpu_layers: int = -1):
@@ -44,16 +46,6 @@ def _truncate_messages(messages: list[dict], max_prompt_tokens: int) -> list[dic
     return system + rest
 
 
-def _with_thinking(messages: list[dict]) -> list[dict]:
-    msgs = list(messages)
-    for i in range(len(msgs) - 1, -1, -1):
-        if msgs[i]["role"] == "user":
-            if not msgs[i]["content"].startswith("/think"):
-                msgs[i] = {**msgs[i], "content": "/think\n" + msgs[i]["content"]}
-            break
-    return msgs
-
-
 def chat(messages: list[dict], on_token=None) -> dict:
     if _model is None:
         raise RuntimeError("Model not loaded.")
@@ -66,6 +58,7 @@ def chat(messages: list[dict], on_token=None) -> dict:
     t0 = time.time()
 
     if on_token is not None:
+        _stop_event.clear()
         stream = _model.create_chat_completion(
             messages=messages,
             temperature=0.6,
@@ -77,12 +70,21 @@ def chat(messages: list[dict], on_token=None) -> dict:
         )
         content = ""
         n_tokens = 0
-        for chunk in stream:
-            delta = chunk["choices"][0]["delta"].get("content") or ""
-            if delta:
-                content += delta
-                n_tokens += 1
-                on_token(delta)
+        try:
+            for chunk in stream:
+                if _stop_event.is_set():
+                    break
+                delta = chunk["choices"][0]["delta"].get("content") or ""
+                if delta:
+                    content += delta
+                    n_tokens += 1
+                    on_token(delta)
+        finally:
+            if hasattr(stream, "close"):
+                try:
+                    stream.close()
+                except Exception:
+                    pass
         elapsed = time.time() - t0
         return {
             "content": content,
@@ -112,4 +114,12 @@ def chat(messages: list[dict], on_token=None) -> dict:
 
 
 def stop():
-    pass
+    _stop_event.set()
+
+
+def estimate_context_usage(messages: list[dict]) -> tuple[int, int]:
+    """Returns (used_tokens, max_tokens). Both 0 if model not loaded."""
+    if _model is None:
+        return 0, 0
+    used = sum(_count_tokens(m) for m in messages)
+    return used, _model.n_ctx()
