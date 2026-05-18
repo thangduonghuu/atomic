@@ -1,2 +1,2 @@
 [console_scripts]
-atomic = atomic.main:run
+atomic = atomic.main:main

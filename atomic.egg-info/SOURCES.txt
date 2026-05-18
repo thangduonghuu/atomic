@@ -2,6 +2,7 @@ README.md
 pyproject.toml
 atomic/__init__.py
 atomic/config.py
+atomic/download.py
 atomic/llm.py
 atomic/main.py
 atomic/model_picker.py

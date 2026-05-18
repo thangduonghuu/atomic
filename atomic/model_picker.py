@@ -1,14 +1,16 @@
 import os
+from rich.console import Console
 from atomic import config
 
+console = Console()
 
-def pick_model() -> str:
+
+def pick_model(force: bool = False) -> str:
     cfg = config.load()
     default = cfg.get("default_model")
     recent = cfg.get("recent_models", [])
     found = config.find_gguf_files()
 
-    # merge: recent first, then discovered, no duplicates
     seen = set()
     options = []
     for p in recent + found:
@@ -16,23 +18,21 @@ def pick_model() -> str:
             seen.add(p)
             options.append(p)
 
-    # auto-use default, only show picker if no default or forced
-    if default and os.path.exists(default):
+    if not force and default and os.path.exists(default):
         return default
 
-    print("\n" + "=" * 50)
-    print("  Select a model")
-    print("=" * 50)
+    console.print("\n" + "=" * 50)
+    console.print("  Select a model")
+    console.print("=" * 50)
 
     if options:
-        print("\n  Available models:")
+        console.print("\n  Available models:")
         for i, path in enumerate(options):
-            marker = " *" if path == default else "  "
-            print(f" {marker} [{i + 1}] {os.path.basename(path)}")
-            print(f"       {path}")
+            marker = "[green]*[/green]" if path == default else " "
+            console.print(f"  {marker} [{i + 1}] {os.path.basename(path)}")
+            console.print(f"       [dim]{path}[/dim]")
 
-    print(f"\n   [m] Enter path manually")
-    print()
+    console.print("\n   [m] Enter path manually\n")
 
     while True:
         choice = input("  Choose [1-{}/m]: ".format(len(options))).strip().lower()
@@ -41,7 +41,7 @@ def pick_model() -> str:
             path = input("  Model path: ").strip()
             path = os.path.expanduser(path)
             if not os.path.exists(path):
-                print(f"  [error] File not found: {path}")
+                console.print(f"  [red]File not found: {path}[/red]")
                 continue
             break
 
@@ -50,11 +50,11 @@ def pick_model() -> str:
             if 0 <= idx < len(options):
                 path = options[idx]
                 break
-            print(f"  [error] Pick a number between 1 and {len(options)}")
+            console.print(f"  [red]Pick a number between 1 and {len(options)}[/red]")
             continue
 
-        print("  [error] Invalid choice.")
+        console.print("  [red]Invalid choice.[/red]")
 
     config.set_default(path)
-    print(f"\n  Saved as default: {os.path.basename(path)}\n")
+    console.print(f"\n  Saved as default: [cyan]{os.path.basename(path)}[/cyan]\n")
     return path
