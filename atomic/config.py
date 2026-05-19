@@ -37,6 +37,16 @@ def set_default(model_path: str):
     save(cfg)
 
 
+def get_thinking_model() -> str | None:
+    return load().get("thinking_model")
+
+
+def set_thinking_model(model_path: str):
+    cfg = load()
+    cfg["thinking_model"] = os.path.expanduser(model_path)
+    save(cfg)
+
+
 def find_gguf_files() -> list[str]:
     cfg = load()
     dirs = cfg.get("search_dirs", DEFAULT_SEARCH_DIRS)

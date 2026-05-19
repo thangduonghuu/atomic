@@ -5,11 +5,13 @@ import sys
 import time
 import queue
 import shutil
+import difflib
 import readline  # noqa: F401 — enables arrow keys, history, backspace via input()
 import threading
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
+from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
 
@@ -17,11 +19,25 @@ from atomic import llm, tools, model_picker
 
 console = Console()
 
-TOOL_READ  = re.compile(r'<read_file\s+path=["\']([^"\']+)["\']')
-TOOL_LIST  = re.compile(r'<list_dir\s+path=["\']([^"\']+)["\']')
-TOOL_WRITE = re.compile(r'<write_file\s+path=["\']([^"\']+)["\']\s*>(.*?)</write_file>', re.DOTALL)
-CODE_BLOCK = re.compile(r'```(bash|sh|shell|python|py|bash-server)\n(.*?)```', re.DOTALL)
-THINK_BLOCK = re.compile(r'<think>(.*?)</think>', re.DOTALL)
+_session_written: list[tuple[str, str]] = []  # (path, "created"|"modified")
+
+DIFF_COLLAPSE_THRESHOLD = 40
+
+EXT_TO_LANG = {
+    ".py": "python", ".js": "javascript", ".ts": "typescript",
+    ".jsx": "javascript", ".tsx": "typescript", ".sh": "bash",
+    ".bash": "bash", ".json": "json", ".yaml": "yaml", ".yml": "yaml",
+    ".toml": "toml", ".md": "markdown", ".html": "html", ".css": "css",
+    ".rs": "rust", ".go": "go", ".rb": "ruby", ".java": "java",
+    ".c": "c", ".cpp": "cpp", ".h": "c",
+}
+
+TOOL_READ    = re.compile(r'<read_file\s+path=["\']([^"\']+)["\']')
+TOOL_LIST    = re.compile(r'<list_dir\s+path=["\']([^"\']+)["\']')
+TOOL_WRITE   = re.compile(r'<write_file\s+path=["\']([^"\']+)["\']\s*>(.*?)</write_file>', re.DOTALL)
+CREATE_NOTE  = re.compile(r'<create_note\s+path=["\']([^"\']+)["\']\s*>(.*?)</create_note>', re.DOTALL)
+CODE_BLOCK   = re.compile(r'```(bash|sh|shell|python|py|bash-server)\n(.*?)```', re.DOTALL)
+THINK_BLOCK  = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 
 LANG_NORM = {"sh": "bash", "shell": "bash", "py": "python", "python3": "python"}
 
@@ -89,6 +105,13 @@ TOOLS:
    Use this for anything that runs forever: dev servers, watchers, repls, etc.
    The system will display it but tell the user to run it in a separate terminal.
 
+6. Create a work note — a markdown planning document saved to disk:
+   <create_note path=".notes/plan.md">
+   # Plan: Feature Name
+   ...
+   </create_note>
+   Use this when a task is complex enough to warrant a written plan. Prefer .notes/ as the directory.
+
 WORKFLOW:
 - Explore with <list_dir> and <read_file> to understand the codebase.
 - Create or edit files with <write_file>.
@@ -118,6 +141,47 @@ npm run dev
 ```"""
 
 
+THINK_SYSTEM_PROMPT = """You are a deep-thinking software investigator. Your job is to thoroughly understand a problem and produce a structured, actionable work note.
+Current working directory: {cwd}
+
+You have these investigation tools:
+
+1. List a directory:
+   <list_dir path="."/>
+
+2. Read a file:
+   <read_file path="src/app.py"/>
+
+3. Create a work note — your primary deliverable:
+   <create_note path=".notes/plan.md">
+   # Plan: Feature Name
+
+   ## Problem
+   What needs to be done and why.
+
+   ## Investigation
+   What you found in the codebase that is relevant.
+
+   ## Approach
+   The strategy you recommend.
+
+   ## Steps
+   - [ ] Step 1 — file: path/to/file.py
+   - [ ] Step 2 — file: path/to/other.py
+   ...
+
+   ## Open Questions
+   Anything that needs clarification before or during implementation.
+   </create_note>
+
+WORKFLOW:
+1. Use <list_dir> and <read_file> to understand the relevant parts of the codebase.
+2. Think carefully: what exists, what is missing, what are the constraints and trade-offs.
+3. Always end with a <create_note> containing your full investigation and implementation plan.
+4. Be specific — name exact files, functions, and line-level changes where possible.
+"""
+
+
 def make_history() -> list[dict]:
     dir_listing = tools.list_dir(".")
     return [
@@ -125,6 +189,119 @@ def make_history() -> list[dict]:
         {"role": "user", "content": f"FYI, current directory contains:\n{dir_listing}"},
         {"role": "assistant", "content": "Got it, I can see the files in your current directory."},
     ]
+
+
+def _make_think_history() -> list[dict]:
+    dir_listing = tools.list_dir(".")
+    return [
+        {"role": "system", "content": THINK_SYSTEM_PROMPT.format(cwd=os.getcwd())},
+        {"role": "user", "content": f"Current directory contains:\n{dir_listing}"},
+        {"role": "assistant", "content": "Ready to investigate. What would you like me to plan?"},
+    ]
+
+
+def _get_lang(path: str) -> str:
+    return EXT_TO_LANG.get(os.path.splitext(path)[1].lower(), "text")
+
+
+def _hl_line(code: str, lang: str) -> Text:
+    try:
+        from pygments import highlight as pyg_highlight
+        from pygments.lexers import get_lexer_by_name
+        from pygments.formatters import Terminal256Formatter
+        lexer = get_lexer_by_name(lang, stripall=True)
+        ansi = pyg_highlight(code, lexer, Terminal256Formatter(style="monokai"))
+        return Text.from_ansi(ansi.rstrip())
+    except Exception:
+        return Text(code)
+
+
+def _make_diff_text(diff_lines: list[str], lang: str) -> Text:
+    result = Text()
+    for line in diff_lines:
+        s = line.rstrip("\n")
+        if s.startswith("+"):
+            result.append("+ ", style="bold green")
+            result.append_text(_hl_line(s[1:], lang))
+            result.append("\n")
+        elif s.startswith("-"):
+            result.append("- ", style="bold red")
+            result.append(s[1:] + "\n", style="red")
+        elif s.startswith("@@"):
+            result.append(s + "\n", style="cyan dim")
+        else:
+            result.append("  ")
+            result.append_text(_hl_line(s[1:] if s.startswith(" ") else s, lang))
+            result.append("\n")
+    return result
+
+
+def _print_diff(path: str, new_content: str) -> bool:
+    """Show diff panel and ask for confirmation. Returns True to proceed with write."""
+    real = os.path.join(os.getcwd(), path)
+    is_new = not os.path.exists(real)
+
+    if is_new:
+        old_lines = []
+    else:
+        try:
+            with open(real, "r", errors="replace") as f:
+                old_lines = f.read().splitlines(keepends=True)
+        except Exception:
+            old_lines = []
+
+    new_lines = new_content.splitlines(keepends=True)
+    diff = list(difflib.unified_diff(old_lines, new_lines, lineterm=""))
+
+    if not diff:
+        return True
+
+    lang = _get_lang(path)
+    added = sum(1 for l in diff if l.startswith("+") and not l.startswith("+++"))
+    removed = sum(1 for l in diff if l.startswith("-") and not l.startswith("---"))
+    diff_lines = diff[2:]  # skip --- +++ headers
+
+    if is_new:
+        stat = f"[dim]new[/dim]  [green]+{added}[/green]"
+    else:
+        stat = f"[green]+{added}[/green] [red]-{removed}[/red]"
+    title = f"[bold cyan]{path}[/bold cyan]  {stat}"
+
+    # Feature 2: collapse large diffs
+    if len(diff_lines) > DIFF_COLLAPSE_THRESHOLD:
+        console.print(Panel(
+            f"[dim]{len(diff_lines)} lines changed[/dim]",
+            title=title, border_style="dim",
+        ))
+        try:
+            ans = input("  Show full diff? (y/N) > ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = "n"
+        if ans in ("y", "yes"):
+            console.print(Panel(_make_diff_text(diff_lines, lang), title=title, border_style="dim"))
+    else:
+        # Features 3 + 4: panel with syntax-highlighted diff
+        console.print(Panel(_make_diff_text(diff_lines, lang), title=title, border_style="dim"))
+
+    # Feature 1: confirm before writing
+    try:
+        ans = input("  Apply? (Y/n) > ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return ans in ("y", "yes", "")
+
+
+def _print_session_summary() -> None:
+    if not _session_written:
+        return
+    created = [p for p, k in _session_written if k == "created"]
+    modified = [p for p, k in _session_written if k == "modified"]
+    parts = []
+    if created:
+        parts.append(f"  [green]Created:[/green] {', '.join(f'[cyan]{p}[/cyan]' for p in created)}")
+    if modified:
+        parts.append(f"  [yellow]Modified:[/yellow] {', '.join(f'[cyan]{p}[/cyan]' for p in modified)}")
+    console.print("\n" + "\n".join(parts))
 
 
 def process_tool_calls(response: str, history: list[dict]) -> tuple[str, dict]:
@@ -145,8 +322,21 @@ def process_tool_calls(response: str, history: list[dict]) -> tuple[str, dict]:
                 tool_results.append(f"Could not read {path}.")
 
         for path, content in TOOL_WRITE.findall(response):
+            stripped = content.lstrip("\n")
+            real = os.path.join(os.getcwd(), path)
+            is_new = not os.path.exists(real)
             console.print(f"  [dim]⚙ writing {path}[/dim]")
+            if _print_diff(path, stripped):
+                result_msg = tools.write_file(path, stripped)
+                _session_written.append((path, "created" if is_new else "modified"))
+            else:
+                result_msg = f"User rejected changes to {path}. Do not attempt to rewrite this file unless asked."
+            tool_results.append(result_msg)
+
+        for path, content in CREATE_NOTE.findall(response):
+            console.print(f"  [dim]⚙ creating note {path}[/dim]")
             result_msg = tools.write_file(path, content.lstrip("\n"))
+            console.print(f"  [green]◉ note saved →[/green] [cyan]{path}[/cyan]")
             tool_results.append(result_msg)
 
         if not tool_results:
@@ -268,6 +458,92 @@ def _stream_chat(history: list[dict]) -> tuple[str, dict] | tuple[None, None]:
     return result["content"], result
 
 
+def _stream_think(history: list[dict]) -> tuple[str, dict] | tuple[None, None]:
+    text_parts: list[str] = []
+    error = None
+    result = None
+
+    with Live("[dim]investigating...[/dim]", console=console, refresh_per_second=12, transient=True) as live:
+        def on_token(t: str):
+            text_parts.append(t)
+            current = "".join(text_parts)
+            lines = current.splitlines()
+            display = "\n".join(lines[-25:])
+            live.update(Text(display))
+
+        try:
+            result = llm.think_chat(history, on_token=on_token)
+        except KeyboardInterrupt:
+            llm.stop()
+            console.print("\n  [dim]interrupted[/dim]")
+            return None, None
+        except Exception as e:
+            error = e
+
+    if error:
+        console.print(f"  [red]error: {error}[/red]")
+        return None, None
+    return result["content"], result
+
+
+def _run_think(prompt: str) -> None:
+    think_name = llm.get_think_model_name()
+    console.print(f"\n  [dim]◉ thinking with {think_name}...[/dim]")
+    history = _make_think_history()
+    history.append({"role": "user", "content": prompt})
+
+    reply, result = _stream_think(history)
+    if reply is None:
+        return
+
+    # process tool calls (read_file, list_dir, create_note) in a loop
+    while True:
+        tool_results = []
+
+        for path in TOOL_LIST.findall(reply):
+            console.print(f"  [dim]⚙ listing {path}[/dim]")
+            tool_results.append(f"Directory listing of {path}:\n{tools.list_dir(path)}")
+
+        for path in TOOL_READ.findall(reply):
+            console.print(f"  [dim]⚙ reading {path}[/dim]")
+            content = tools.read_file(path)
+            tool_results.append(f"Contents of {path}:\n```\n{content}\n```" if content else f"Could not read {path}.")
+
+        for path, content in CREATE_NOTE.findall(reply):
+            console.print(f"  [dim]⚙ creating note {path}[/dim]")
+            tools.write_file(path, content.lstrip("\n"))
+            console.print(f"  [green]◉ note saved →[/green] [cyan]{path}[/cyan]")
+
+        if not tool_results:
+            break
+
+        history.append({"role": "assistant", "content": reply})
+        history.append({"role": "user", "content": "\n\n".join(tool_results)})
+        next_reply, result = _stream_think(history)
+        if next_reply is None:
+            break
+        reply = next_reply
+
+    # strip create_note blocks from display output
+    display = CREATE_NOTE.sub(
+        lambda m: f"*→ note saved: `{m.group(1)}`*",
+        reply,
+    ).strip()
+
+    think_match = THINK_BLOCK.search(display)
+    if think_match:
+        thinking = think_match.group(1).strip()
+        display = THINK_BLOCK.sub("", display).strip()
+        think_tokens = len(thinking.split())
+        console.print(f"\n[dim]  ◦ thought for ~{think_tokens} words[/dim]\n")
+
+    console.print(Markdown(display))
+    elapsed = result.get("elapsed", 0)
+    comp = result.get("completion_tokens", 0)
+    tps = comp / elapsed if elapsed > 0 else 0
+    console.print(f"\n[dim]  ⏱ {elapsed:.1f}s · {comp} tok · {tps:.0f} tok/s[/dim]")
+
+
 def _respond(history: list[dict]) -> str | None:
     reply, result = _stream_chat(history)
     if reply is None:
@@ -328,9 +604,15 @@ def _save_conversation(history: list[dict], path: str) -> None:
 
 def run():
     global _script_session_allowed
+    from atomic import config as cfg_mod
+
     model_path = model_picker.pick_model()
     console.print(f"\n  [dim]Loading model...[/dim]", end="\r")
     llm.load_model(model_path)
+
+    think_path = cfg_mod.get_thinking_model()
+    if think_path and os.path.exists(think_path):
+        llm.load_think_model(think_path)
 
     model_name = os.path.basename(model_path)
     console.print(Rule(f"[cyan]atomic[/cyan]  [dim]{model_name}[/dim]"))
@@ -343,6 +625,7 @@ def run():
             user_input = get_input()
         except EOFError:
             llm.stop()
+            _print_session_summary()
             console.print("\n[dim]bye.[/dim]")
             break
         except KeyboardInterrupt:
@@ -354,6 +637,7 @@ def run():
 
         if user_input in ("/exit", "/quit"):
             llm.stop()
+            _print_session_summary()
             console.print("[dim]bye.[/dim]")
             break
 
@@ -365,6 +649,8 @@ def run():
             continue
 
         if user_input == "/clear":
+            _print_session_summary()
+            _session_written.clear()
             console.clear()
             console.print(Rule(f"[cyan]atomic[/cyan]  [dim]{model_name}[/dim]"))
             history = make_history()
@@ -375,13 +661,15 @@ def run():
             console.print("""
   [bold]Commands:[/bold]
 
-  [cyan]/read <path>[/cyan]     Load a file into context
-  [cyan]/model[/cyan]           Switch model mid-session
-  [cyan]/server[/cyan]          Stop the background server
-  [cyan]/save [path][/cyan]     Save conversation to a markdown file
-  [cyan]/clear[/cyan]           Reset conversation history
-  [cyan]/help[/cyan]            Show this help
-  [cyan]/exit[/cyan], [cyan]/quit[/cyan]   Exit
+  [cyan]/read <path>[/cyan]          Load a file into context
+  [cyan]/model[/cyan]                Switch main model mid-session
+  [cyan]/think <prompt>[/cyan]       Deep investigation → saves a work note
+  [cyan]/think-model[/cyan]          Set the thinking model
+  [cyan]/server[/cyan]               Stop the background server
+  [cyan]/save [path][/cyan]          Save conversation to a markdown file
+  [cyan]/clear[/cyan]                Reset conversation history
+  [cyan]/help[/cyan]                 Show this help
+  [cyan]/exit[/cyan], [cyan]/quit[/cyan]        Exit
 """)
             continue
 
@@ -389,6 +677,23 @@ def run():
             parts = user_input.split(None, 1)
             save_path = parts[1].strip() if len(parts) > 1 else f"atomic-{int(time.time())}.md"
             _save_conversation(history, save_path)
+            continue
+
+        if user_input.startswith("/think "):
+            prompt = user_input[7:].strip()
+            if prompt:
+                _run_think(prompt)
+            else:
+                console.print("  [dim]Usage: /think <what to investigate>[/dim]\n")
+            continue
+
+        if user_input == "/think-model":
+            think_path = model_picker.pick_model(force=True)
+            console.print("  [dim]Loading thinking model...[/dim]", end="\r")
+            from atomic import config as cfg_mod
+            cfg_mod.set_thinking_model(think_path)
+            llm.load_think_model(think_path)
+            console.print(f"  [dim]Thinking model set to {os.path.basename(think_path)}[/dim]\n")
             continue
 
         if user_input == "/model":
@@ -521,7 +826,7 @@ def _print_help():
     console.print("    atomic model list             List available models")
     console.print("    atomic model add <path>       Register a local .gguf file")
     console.print("    atomic model download [repo]  Download from HuggingFace\n")
-    console.print("  [dim]Inside chat: /model  /clear  /read <path>  /exit[/dim]\n")
+    console.print("  [dim]Inside chat: /think <prompt>  /think-model  /model  /clear  /read <path>  /exit[/dim]\n")
 
 
 def main():
