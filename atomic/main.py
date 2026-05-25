@@ -38,11 +38,106 @@ TOOL_WRITE   = re.compile(r'<write_file\s+path=["\']([^"\']+)["\']\s*>(.*?)</wri
 CREATE_NOTE  = re.compile(r'<create_note\s+path=["\']([^"\']+)["\']\s*>(.*?)</create_note>', re.DOTALL)
 CODE_BLOCK   = re.compile(r'```(bash|sh|shell|python|py|bash-server)\n(.*?)```', re.DOTALL)
 THINK_BLOCK  = re.compile(r'<think>(.*?)</think>', re.DOTALL)
+AGENT_DONE   = re.compile(r'<done>(.*?)</done>', re.DOTALL)
+_AGENT_STRIP = re.compile(
+    r'<(?:list_dir|read_file)\s[^>]*/?>|<write_file\s[^>]*>.*?</write_file>|<done>.*?</done>',
+    re.DOTALL,
+)
 
 LANG_NORM = {"sh": "bash", "shell": "bash", "py": "python", "python3": "python"}
 
 _script_session_allowed: bool | None = None  # None=not asked, True=allowed, False=denied
+_write_session_allowed: bool | None = None   # None=not asked, True=always, False=ask each time
 _server_queue: queue.Queue = queue.Queue()
+
+
+def _tg_send(token: str, chat_id: str, text: str) -> None:
+    import urllib.request, json as _json
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = _json.dumps({"chat_id": chat_id, "text": text[:4096]}).encode()
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass
+
+
+def _tg_get_updates(token: str, offset: int, timeout: int = 30) -> list:
+    import urllib.request, json as _json
+    url = f"https://api.telegram.org/bot{token}/getUpdates?offset={offset}&timeout={timeout}"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout + 5) as r:
+            return _json.loads(r.read()).get("result", [])
+    except Exception:
+        return []
+
+
+def _notify_telegram(message: str) -> None:
+    from atomic import config as cfg_mod
+    tg = cfg_mod.get_telegram()
+    if not tg:
+        return
+    _tg_send(tg["token"], tg["chat_id"], message)
+
+
+def _setup_telegram() -> None:
+    from atomic import config as cfg_mod
+
+    existing = cfg_mod.get_telegram()
+
+    console.print("\n  [bold]Telegram setup[/bold]\n")
+
+    if existing:
+        masked = existing["token"][:8] + "..." + existing["token"][-4:]
+        console.print(f"  Current token  : [dim]{masked}[/dim]")
+        console.print(f"  Current chat_id: [dim]{existing['chat_id']}[/dim]\n")
+        console.print("  Press Enter to keep the current value, or type a new one.\n")
+
+    # Token
+    try:
+        prompt = f"  Bot token [{existing['token'][:8]}...] > " if existing else "  Bot token > "
+        raw_token = input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+    token = raw_token if raw_token else (existing["token"] if existing else "")
+    if not token:
+        return
+
+    # Chat ID — try auto-fetch first
+    console.print("  [dim]Fetching chat_id from recent messages...[/dim]")
+    chat_id = None
+    try:
+        import urllib.request, json as _json
+        url = f"https://api.telegram.org/bot{token}/getUpdates?timeout=0"
+        with urllib.request.urlopen(url, timeout=10) as r:
+            data = _json.loads(r.read())
+        updates = data.get("result", [])
+        if updates:
+            chat_id = str(updates[-1]["message"]["chat"]["id"])
+            name = updates[-1]["message"]["chat"].get("first_name", chat_id)
+            console.print(f"  [green]Found chat:[/green] {name}  [dim](id: {chat_id})[/dim]")
+        else:
+            console.print("  [yellow]No messages found via getUpdates.[/yellow]")
+    except Exception as e:
+        console.print(f"  [yellow]Could not fetch updates: {e}[/yellow]")
+
+    if not chat_id:
+        existing_id = existing["chat_id"] if existing else ""
+        prompt = f"  chat_id [{existing_id}] > " if existing_id else "  chat_id > "
+        console.print("  [dim]Get your chat_id from @userinfobot on Telegram.[/dim]")
+        try:
+            raw_id = input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        chat_id = raw_id if raw_id else existing_id
+        if not chat_id:
+            return
+
+    cfg_mod.set_telegram(token, chat_id)
+
+    # test message
+    _notify_telegram("atomic connected ✓")
+    console.print("  [green]Saved.[/green] Test message sent — check Telegram.\n")
 
 
 def _server_print(line: str) -> None:
@@ -91,6 +186,7 @@ TOOLS:
    <write_file path="src/app.py">
    full file content here
    </write_file>
+   IMPORTANT: When fixing or editing an existing file, ALWAYS use <write_file> — never show the corrected code in a markdown block. The user will be shown a diff and asked to confirm before the file is written.
 
 4. Run a one-time shell command (auto-executed — must exit on its own):
    ```bash
@@ -182,6 +278,47 @@ WORKFLOW:
 """
 
 
+AGENT_SYSTEM_PROMPT = """You are an autonomous coding agent with direct filesystem access.
+Current working directory: {cwd}
+
+Your job: receive a task, plan it, then implement it fully — step by step — without waiting for the user between steps.
+
+TOOLS:
+
+1. List directory:
+   <list_dir path="."/>
+
+2. Read file:
+   <read_file path="src/app.py"/>
+
+3. Write/overwrite file (user sees diff and confirms before it is written):
+   <write_file path="src/app.py">
+   full file content here
+   </write_file>
+   Always read a file before writing it.
+
+4. Run a shell command (auto-executed, must exit on its own):
+   ```bash
+   command here
+   ```
+
+5. Signal task completion:
+   <done>Brief summary of what was accomplished.</done>
+
+WORKFLOW:
+1. Explore with <list_dir> and <read_file> to understand the relevant code.
+2. Narrate your plan briefly, then execute step by step.
+3. After each tool result, continue with the next step — do not stop to ask questions.
+4. Verify changes when sensible (run tests, build, grep, etc.).
+5. End every run with <done>summary</done> once the task is complete.
+
+RULES:
+- Make reasonable decisions and proceed — do not ask the user for clarification.
+- Use <write_file> for ALL file edits; never output corrected code as a plain markdown block.
+- Each ```bash``` block is an independent subprocess; use && to chain dependent commands.
+"""
+
+
 def make_history() -> list[dict]:
     dir_listing = tools.list_dir(".")
     return [
@@ -238,6 +375,8 @@ def _make_diff_text(diff_lines: list[str], lang: str) -> Text:
 
 def _print_diff(path: str, new_content: str) -> bool:
     """Show diff panel and ask for confirmation. Returns True to proceed with write."""
+    global _write_session_allowed
+
     real = os.path.join(os.getcwd(), path)
     is_new = not os.path.exists(real)
 
@@ -267,7 +406,6 @@ def _print_diff(path: str, new_content: str) -> bool:
         stat = f"[green]+{added}[/green] [red]-{removed}[/red]"
     title = f"[bold cyan]{path}[/bold cyan]  {stat}"
 
-    # Feature 2: collapse large diffs
     if len(diff_lines) > DIFF_COLLAPSE_THRESHOLD:
         console.print(Panel(
             f"[dim]{len(diff_lines)} lines changed[/dim]",
@@ -280,14 +418,20 @@ def _print_diff(path: str, new_content: str) -> bool:
         if ans in ("y", "yes"):
             console.print(Panel(_make_diff_text(diff_lines, lang), title=title, border_style="dim"))
     else:
-        # Features 3 + 4: panel with syntax-highlighted diff
         console.print(Panel(_make_diff_text(diff_lines, lang), title=title, border_style="dim"))
 
-    # Feature 1: confirm before writing
+    if _write_session_allowed:
+        console.print(f"  [dim]⚙ writing {path} (allowed this session)[/dim]")
+        return True
+
     try:
-        ans = input("  Apply? (Y/n) > ").strip().lower()
+        ans = input("  Allow write? [y]es / [n]o / [a]lways this session > ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         return False
+
+    if ans in ("a", "always"):
+        _write_session_allowed = True
+        return True
     return ans in ("y", "yes", "")
 
 
@@ -424,7 +568,7 @@ def _run_with_autofix(code: str, lang: str, history: list[dict], max_retries: in
 def _is_truncated(text: str) -> bool:
     if text.count("```") % 2 != 0:
         return True
-    for tag in ("read_file", "write_file", "list_dir"):
+    for tag in ("write_file", "create_note"):
         if text.count(f"<{tag}") > text.count(f"</{tag}>"):
             return True
     return False
@@ -542,6 +686,118 @@ def _run_think(prompt: str) -> None:
     comp = result.get("completion_tokens", 0)
     tps = comp / elapsed if elapsed > 0 else 0
     console.print(f"\n[dim]  ⏱ {elapsed:.1f}s · {comp} tok · {tps:.0f} tok/s[/dim]")
+    _notify_telegram(f"atomic /think done ✓\n{prompt[:80]}")
+
+
+def _run_agent(task: str) -> None:
+    import time as _time
+
+    model_name = llm.get_model_name()
+    console.print(f"\n  [dim]◉ agent — {model_name}[/dim]\n")
+
+    history = [
+        {"role": "system", "content": AGENT_SYSTEM_PROMPT.format(cwd=os.getcwd())},
+        {"role": "user", "content": f"Directory:\n{tools.list_dir('.')}\n\nTask: {task}"},
+    ]
+
+    step = 0
+    while True:
+        step += 1
+        console.print(f"[dim]  ── step {step} ──[/dim]")
+
+        reply, result = _stream_chat(history)
+        if reply is None:
+            break
+
+        # Strip think block
+        think_match = THINK_BLOCK.search(reply)
+        if think_match:
+            reply = THINK_BLOCK.sub("", reply).strip()
+            think_tokens = len(think_match.group(1).split())
+            console.print(f"\n[dim]  ◦ thought for ~{think_tokens} words[/dim]\n")
+
+        # Display reply with tool tags removed so it reads naturally
+        display = _AGENT_STRIP.sub("", reply).strip()
+        if display:
+            console.print(Markdown(display))
+
+        # Check for completion signal first
+        done_match = AGENT_DONE.search(reply)
+        if done_match:
+            summary = done_match.group(1).strip()
+            console.print(f"\n[green]  ◉ done:[/green] {summary}\n")
+            _notify_telegram(f"atomic agent done ✓\n{summary}")
+            break
+
+        tool_results: list[str] = []
+
+        for path in TOOL_LIST.findall(reply):
+            console.print(f"  [dim]⚙ listing {path}[/dim]")
+            tool_results.append(f"Directory listing of {path}:\n{tools.list_dir(path)}")
+
+        for path in TOOL_READ.findall(reply):
+            console.print(f"  [dim]⚙ reading {path}[/dim]")
+            content = tools.read_file(path)
+            tool_results.append(
+                f"Contents of {path}:\n```\n{content}\n```" if content else f"Could not read {path}."
+            )
+
+        for path, content in TOOL_WRITE.findall(reply):
+            stripped = content.lstrip("\n")
+            real = os.path.join(os.getcwd(), path)
+            is_new = not os.path.exists(real)
+            if _print_diff(path, stripped):
+                result_msg = tools.write_file(path, stripped)
+                _session_written.append((path, "created" if is_new else "modified"))
+            else:
+                result_msg = f"User rejected changes to {path}. Do not rewrite unless asked."
+            tool_results.append(result_msg)
+
+        for match in CODE_BLOCK.finditer(reply):
+            raw_lang = match.group(1)
+            code = match.group(2).strip()
+
+            if raw_lang == "bash-server":
+                _print_script("bash", code)
+                tools.run_server_background(code, on_line=_server_print)
+                tool_results.append("Background server started.")
+                continue
+
+            lang = LANG_NORM.get(raw_lang, raw_lang)
+            _print_script(lang, code)
+
+            output_lines: list[str] = []
+            start = _time.monotonic()
+            try:
+                with Live("  [dim]running...[/dim]", console=console, refresh_per_second=15, transient=False) as live:
+                    def _on_line(line: str, _buf=output_lines, _t=start, _live=live):
+                        _buf.append(line)
+                        body = "\n".join(f"  [dim]│[/dim] {l}" for l in _buf[-20:])
+                        _live.update(f"  [dim]{_time.monotonic() - _t:.1f}s[/dim]\n{body}")
+                    script_result = tools.run_script(code, lang, on_line=_on_line)
+            except KeyboardInterrupt:
+                console.print("\n  [dim]interrupted[/dim]\n")
+                return
+
+            elapsed = _time.monotonic() - start
+            if script_result["ok"]:
+                console.print(f"  [green]✓[/green]  [dim]{elapsed:.1f}s[/dim]")
+                tool_results.append(f"Script output:\n```\n{script_result['output']}\n```")
+            else:
+                console.print(f"  [red]✗ exit {script_result['returncode']}[/red]  [dim]{elapsed:.1f}s[/dim]")
+                tool_results.append(
+                    f"Script failed (exit {script_result['returncode']}):\n```\n{script_result['output']}\n```"
+                )
+
+        if not tool_results:
+            console.print("\n  [dim]◉ agent finished.[/dim]\n")
+            _notify_telegram("atomic agent finished.")
+            break
+
+        history.append({"role": "assistant", "content": reply})
+        history.append({"role": "user", "content": "\n\n".join(tool_results)})
+
+    _print_session_summary()
 
 
 def _respond(history: list[dict]) -> str | None:
@@ -564,6 +820,27 @@ def _respond(history: list[dict]) -> str | None:
         reply = reply.rstrip() + "\n" + cont
         result = cont_result
 
+    has_tools = bool(
+        TOOL_WRITE.search(reply) or TOOL_READ.search(reply)
+        or TOOL_LIST.search(reply) or CREATE_NOTE.search(reply)
+    )
+
+    # Strip think block first (applies to both paths)
+    think_match = THINK_BLOCK.search(reply)
+    if think_match:
+        thinking = think_match.group(1).strip()
+        reply = THINK_BLOCK.sub("", reply).strip()
+        think_tokens = len(thinking.split())
+        console.print(f"\n[dim]  ◦ thought for ~{think_tokens} words[/dim]\n")
+
+    if has_tools:
+        # Show model's suggestion text BEFORE applying any tools so the user
+        # can read the explanation before being asked to confirm writes.
+        pre_text = TOOL_WRITE.sub("", TOOL_READ.sub("", TOOL_LIST.sub(
+            "", CREATE_NOTE.sub("", reply)))).strip()
+        if pre_text:
+            console.print(Markdown(pre_text))
+
     reply, tool_stats = process_tool_calls(reply, history)
     if tool_stats:
         result = tool_stats
@@ -572,13 +849,14 @@ def _respond(history: list[dict]) -> str | None:
     comp = result.get("completion_tokens", 0)
     tps = comp / elapsed if elapsed > 0 else 0
 
-    think_match = THINK_BLOCK.search(reply)
-    if think_match:
-        thinking = think_match.group(1).strip()
+    # After tool calls the model may return a follow-up; strip think again.
+    think_match2 = THINK_BLOCK.search(reply)
+    if think_match2:
         reply = THINK_BLOCK.sub("", reply).strip()
-        think_tokens = len(thinking.split())
-        console.print(f"\n[dim]  ◦ thought for ~{think_tokens} words[/dim]\n")
 
+    # If we already printed the pre-text above and there's nothing new to say,
+    # avoid reprinting. process_tool_calls returns the follow-up reply from the
+    # model (after it sees tool results), so print it unconditionally.
     console.print(Markdown(reply))
     ctx_used, ctx_max = llm.estimate_context_usage(history)
     ctx_info = f"  ctx {ctx_used:,}/{ctx_max:,}" if ctx_max else ""
@@ -655,15 +933,18 @@ def run():
             console.print(Rule(f"[cyan]atomic[/cyan]  [dim]{model_name}[/dim]"))
             history = make_history()
             _script_session_allowed = None
+            _write_session_allowed = None
             continue
 
         if user_input == "/help":
             console.print("""
   [bold]Commands:[/bold]
 
+  [cyan]/agent <task>[/cyan]         Autonomous agent: plans and implements the task
+  [cyan]/think <prompt>[/cyan]       Deep investigation → saves a work note
+  [cyan]/telegram[/cyan]             Set up Telegram notifications
   [cyan]/read <path>[/cyan]          Load a file into context
   [cyan]/model[/cyan]                Switch main model mid-session
-  [cyan]/think <prompt>[/cyan]       Deep investigation → saves a work note
   [cyan]/think-model[/cyan]          Set the thinking model
   [cyan]/server[/cyan]               Stop the background server
   [cyan]/save [path][/cyan]          Save conversation to a markdown file
@@ -677,6 +958,18 @@ def run():
             parts = user_input.split(None, 1)
             save_path = parts[1].strip() if len(parts) > 1 else f"atomic-{int(time.time())}.md"
             _save_conversation(history, save_path)
+            continue
+
+        if user_input == "/telegram":
+            _setup_telegram()
+            continue
+
+        if user_input.startswith("/agent "):
+            task = user_input[7:].strip()
+            if task:
+                _run_agent(task)
+            else:
+                console.print("  [dim]Usage: /agent <task description>[/dim]\n")
             continue
 
         if user_input.startswith("/think "):
@@ -766,6 +1059,178 @@ def run():
 
 
 
+def _run_agent_serve(task: str, token: str, chat_id: str) -> None:
+    """Agent loop for serve mode — runs on a background thread, no Live display."""
+
+    def send(text: str):
+        _tg_send(token, chat_id, text)
+
+    def chat_simple(history: list[dict]) -> str | None:
+        try:
+            console.print(f"[dim]  model thinking...[/dim]")
+            result = llm.chat(history)
+            console.print(f"[dim]  model done ({len(result['content'])} chars)[/dim]")
+            return result["content"]
+        except Exception as e:
+            console.print(f"[red]  model error: {e}[/red]")
+            send(f"Model error: {e}")
+            return None
+
+    send(f"▶ {task[:200]}")
+
+    history = [
+        {"role": "system", "content": AGENT_SYSTEM_PROMPT.format(cwd=os.getcwd())},
+        {"role": "user", "content": f"Directory:\n{tools.list_dir('.')}\n\nTask: {task}"},
+    ]
+
+    step = 0
+    while True:
+        step += 1
+
+        reply = chat_simple(history)
+        if reply is None:
+            send("Agent interrupted.")
+            break
+
+        think_match = THINK_BLOCK.search(reply)
+        if think_match:
+            reply = THINK_BLOCK.sub("", reply).strip()
+
+        done_match = AGENT_DONE.search(reply)
+        display = _AGENT_STRIP.sub("", reply).strip()
+
+        if display:
+            send(f"Step {step}: {display[:500]}")
+
+        if done_match:
+            send(f"✓ Done\n{done_match.group(1).strip()}")
+            break
+
+        tool_results: list[str] = []
+
+        for path in TOOL_LIST.findall(reply):
+            tool_results.append(f"Directory listing of {path}:\n{tools.list_dir(path)}")
+
+        for path in TOOL_READ.findall(reply):
+            content = tools.read_file(path)
+            tool_results.append(
+                f"Contents of {path}:\n```\n{content}\n```" if content else f"Could not read {path}."
+            )
+
+        for path, content in TOOL_WRITE.findall(reply):
+            stripped = content.lstrip("\n")
+            real = os.path.join(os.getcwd(), path)
+            is_new = not os.path.exists(real)
+            result_msg = tools.write_file(path, stripped)
+            _session_written.append((path, "created" if is_new else "modified"))
+            send(f"{'Created' if is_new else 'Modified'}: {path}")
+            tool_results.append(result_msg)
+
+        for match in CODE_BLOCK.finditer(reply):
+            raw_lang = match.group(1)
+            code = match.group(2).strip()
+
+            if raw_lang == "bash-server":
+                tools.run_server_background(code, on_line=_server_print)
+                tool_results.append("Background server started.")
+                continue
+
+            lang = LANG_NORM.get(raw_lang, raw_lang)
+            out_lines: list[str] = []
+            try:
+                script_result = tools.run_script(code, lang, on_line=lambda l: out_lines.append(l))
+            except Exception as e:
+                tool_results.append(f"Error: {e}")
+                continue
+
+            out = script_result["output"]
+            if script_result["ok"]:
+                tool_results.append(f"Script output:\n```\n{out[-1000:]}\n```")
+            else:
+                send(f"✗ Script failed (exit {script_result['returncode']})\n{out[-300:]}")
+                tool_results.append(f"Script failed (exit {script_result['returncode']}):\n```\n{out}\n```")
+
+        if not tool_results:
+            send("Agent finished.")
+            break
+
+        history.append({"role": "assistant", "content": reply})
+        history.append({"role": "user", "content": "\n\n".join(tool_results)})
+
+
+def _serve() -> None:
+    from atomic import config as cfg_mod
+
+    tg = cfg_mod.get_telegram()
+    if not tg:
+        console.print("\n  [yellow]Telegram not configured yet — let's set it up now.[/yellow]\n")
+        _setup_telegram()
+        tg = cfg_mod.get_telegram()
+        if not tg:
+            console.print("[red]Setup cancelled. Run `atomic serve` again when ready.[/red]")
+            sys.exit(1)
+
+    token = tg["token"]
+    chat_id = tg["chat_id"]
+    cwd = os.getcwd()
+
+    model_path = model_picker.pick_model()
+    console.print("  [dim]Loading model...[/dim]", end="\r")
+    llm.load_model(model_path)
+    model_name = os.path.basename(model_path)
+    console.print(Rule(f"[cyan]atomic serve[/cyan]  [dim]{model_name}[/dim]"))
+    console.print(f"  [dim]dir: {cwd}[/dim]")
+    console.print(f"  [dim]Listening on Telegram... Ctrl+C to stop.[/dim]\n")
+
+    _tg_send(token, chat_id, f"atomic online ✓\nModel: {model_name}\nDir: {cwd}\n\nSend me a task.")
+
+    # Use a queue so model inference always runs on the main thread (llama-cpp is not thread-safe)
+    task_queue: queue.Queue = queue.Queue()
+
+    def poll_loop():
+        offset = 0
+        while True:
+            try:
+                updates = _tg_get_updates(token, offset, timeout=20)
+            except Exception as e:
+                console.print(f"[red]  poll error: {e}[/red]")
+                time.sleep(3)
+                continue
+            for update in updates:
+                offset = update["update_id"] + 1
+                msg = update.get("message")
+                if not msg:
+                    continue
+                incoming_id = str(msg.get("chat", {}).get("id", ""))
+                console.print(f"[dim]  poll: msg from {incoming_id} (expected {chat_id})[/dim]")
+                if incoming_id != str(chat_id):
+                    continue
+                text = msg.get("text", "").strip()
+                if text:
+                    console.print(f"[dim]  queued: {text[:60]}[/dim]")
+                    task_queue.put(text)
+
+    poll_thread = threading.Thread(target=poll_loop, daemon=True)
+    poll_thread.start()
+
+    try:
+        while True:
+            try:
+                task = task_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+            console.print(f"[dim]  ← {task[:80]}[/dim]")
+            try:
+                _run_agent_serve(task, token, chat_id)
+            except Exception as e:
+                _tg_send(token, chat_id, f"Error: {e}")
+                console.print(f"[red]  task error: {e}[/red]")
+    except KeyboardInterrupt:
+        _tg_send(token, chat_id, "atomic offline.")
+        console.print("\n[dim]bye.[/dim]")
+        llm.stop()
+
+
 def _model_add(path: str):
     from atomic import config as cfg_mod
     path = os.path.expanduser(path)
@@ -822,11 +1287,12 @@ def _print_help():
     console.print("\n  [bold cyan]atomic[/bold cyan] — local LLM assistant\n")
     console.print("  [bold]Usage:[/bold]")
     console.print("    atomic                        Start chat")
+    console.print("    atomic serve                  Listen on Telegram 24/7 (long-poll)")
     console.print("    atomic model                  Re-select default model")
     console.print("    atomic model list             List available models")
     console.print("    atomic model add <path>       Register a local .gguf file")
     console.print("    atomic model download [repo]  Download from HuggingFace\n")
-    console.print("  [dim]Inside chat: /think <prompt>  /think-model  /model  /clear  /read <path>  /exit[/dim]\n")
+    console.print("  [dim]Inside chat: /agent  /think  /telegram  /model  /clear  /read  /exit[/dim]\n")
 
 
 def main():
@@ -838,6 +1304,10 @@ def main():
 
     if args[0] in ("-h", "--help", "help"):
         _print_help()
+        return
+
+    if args[0] == "serve":
+        _serve()
         return
 
     if args[0] == "model":
