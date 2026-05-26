@@ -47,6 +47,16 @@ def set_thinking_model(model_path: str):
     save(cfg)
 
 
+def get_telegram() -> dict | None:
+    return load().get("telegram")
+
+
+def set_telegram(token: str, chat_id: str):
+    cfg = load()
+    cfg["telegram"] = {"token": token, "chat_id": chat_id}
+    save(cfg)
+
+
 def find_gguf_files() -> list[str]:
     cfg = load()
     dirs = cfg.get("search_dirs", DEFAULT_SEARCH_DIRS)
