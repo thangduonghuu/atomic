@@ -19,42 +19,13 @@ Local-first CLI coding assistant powered by any GGUF model via llama-cpp-python.
 
 ## Setup
 
-### 1. Clone the repo
-
 ```bash
-git clone https://github.com/thangduonghuu/atomic
-cd atomic
+git clone https://github.com/thangduonghuu/atomic && cd atomic && ./install.sh
 ```
 
-### 2. Create a virtual environment (recommended)
+That's it. The script auto-detects your GPU (Apple Metal, NVIDIA CUDA, or CPU), installs everything into `~/.atomic/`, and adds an `atomic` command to your PATH.
 
-```bash
-python3 -m venv venv
-source venv/bin/activate
-```
-
-### 3. Install llama-cpp-python
-
-**Mac — Metal GPU acceleration:**
-```bash
-CMAKE_ARGS="-DGGML_METAL=on" pip install llama-cpp-python
-```
-
-**Linux — CUDA:**
-```bash
-CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python
-```
-
-**CPU only:**
-```bash
-pip install llama-cpp-python
-```
-
-### 4. Install atomic
-
-```bash
-pip install -e .
-```
+**Requirements:** Python 3.10+
 
 ---
 
