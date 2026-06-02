@@ -121,9 +121,15 @@ def _setup_telegram() -> None:
             data = _json.loads(r.read())
         updates = data.get("result", [])
         if updates:
-            chat_id = str(updates[-1]["message"]["chat"]["id"])
-            name = updates[-1]["message"]["chat"].get("first_name", chat_id)
-            console.print(f"  [green]Found chat:[/green] {name}  [dim](id: {chat_id})[/dim]")
+            last_msg = next(
+                (u.get("message") or u.get("edited_message") or u.get("channel_post")
+                 for u in reversed(updates) if u.get("message") or u.get("edited_message") or u.get("channel_post")),
+                None,
+            )
+            if last_msg:
+                chat_id = str(last_msg["chat"]["id"])
+                name = last_msg["chat"].get("first_name", chat_id)
+                console.print(f"  [green]Found chat:[/green] {name}  [dim](id: {chat_id})[/dim]")
         else:
             console.print("  [yellow]No messages found via getUpdates.[/yellow]")
     except Exception as e:
@@ -608,6 +614,10 @@ def process_tool_calls(response: str, history: list[dict]) -> tuple[str, dict]:
             tool_results.append(result_msg)
 
         for path, content in CREATE_NOTE.findall(response):
+            safe = os.path.normpath(path)
+            if safe.startswith("..") or (not safe.startswith(".notes") and not safe.startswith("notes")):
+                tool_results.append(f"[error] create_note path must be under .notes/ — got: {path}")
+                continue
             console.print(f"  [dim]⚙ creating note {path}[/dim]")
             result_msg = tools.write_file(path, content.lstrip("\n"))
             console.print(f"  [green]◉ note saved →[/green] [cyan]{path}[/cyan]")
@@ -698,8 +708,10 @@ def _run_with_autofix(code: str, lang: str, history: list[dict], max_retries: in
 def _is_truncated(text: str) -> bool:
     if text.count("```") % 2 != 0:
         return True
-    for tag in ("write_file", "create_note"):
-        if text.count(f"<{tag}") > text.count(f"</{tag}>"):
+    for tag in ("write_file", "edit_file", "create_note", "read_file", "list_dir"):
+        opens = text.count(f"<{tag}")
+        closes = text.count(f"</{tag}>") + text.count(f"/{tag}>")
+        if opens > closes:
             return True
     return False
 
@@ -974,6 +986,8 @@ def _respond(history: list[dict]) -> str | None:
     has_tools = bool(
         TOOL_WRITE.search(reply) or TOOL_READ.search(reply)
         or TOOL_LIST.search(reply) or CREATE_NOTE.search(reply)
+        or TOOL_EDIT.search(reply) or TOOL_GREP.search(reply)
+        or TOOL_GIT.search(reply)
     )
 
     # Strip think block first (applies to both paths)
@@ -1286,6 +1300,9 @@ def _run_agent_serve(task: str, token: str, chat_id: str) -> None:
     step = 0
     while True:
         step += 1
+        if step > AGENT_MAX_STEPS:
+            send(f"⚠ Reached {AGENT_MAX_STEPS}-step limit. Send a new /agent task to continue.")
+            break
 
         reply = chat_simple(history)
         if reply is None:
@@ -1417,6 +1434,7 @@ def _run_chat_serve(text: str, token: str, chat_id: str, history: list[dict]) ->
             content = tools.read_file(path)
             tool_results.append(f"Contents of {path}:\n```\n{content}\n```" if content else f"Could not read {path}.")
         for path, content in TOOL_WRITE.findall(reply):
+            tools.backup_file(path)
             result_msg = tools.write_file(path, content.lstrip("\n"))
             send(f"Modified: {path}")
             tool_results.append(result_msg)
@@ -1515,6 +1533,13 @@ def _serve() -> None:
                         _run_agent_serve(task, token, chat_id)
                     else:
                         _tg_send(token, chat_id, "Usage: /agent <task description>")
+                elif text == "/undo":
+                    result = tools.undo_last_write()
+                    if result:
+                        original, _ = result
+                        _tg_send(token, chat_id, f"↩ Restored: {original}")
+                    else:
+                        _tg_send(token, chat_id, "Nothing to undo.")
                 elif text == "/clear":
                     chat_history.clear()
                     chat_history.extend(make_history())
@@ -1533,6 +1558,7 @@ def _serve() -> None:
                     _tg_send(token, chat_id, (
                         "Commands:\n"
                         "/agent <task> — autonomous coding agent\n"
+                        "/undo — restore last file changed by agent\n"
                         "/status — show model, dir, uptime\n"
                         "/clear — reset conversation\n"
                         "/help — show this help\n\n"

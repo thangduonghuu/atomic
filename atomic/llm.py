@@ -42,19 +42,26 @@ def get_think_model_name() -> str:
     return _think_model_name or _model_name
 
 
-def _count_tokens(msg: dict) -> int:
+def _count_tokens(msg: dict, model=None) -> int:
+    m = model or _model
     try:
-        return len(_model.tokenize(msg["content"].encode(), add_bos=False))
+        return len(m.tokenize(msg["content"].encode(), add_bos=False))
     except Exception:
         return len(msg["content"]) // 4
 
 
-def _truncate_messages(messages: list[dict], max_prompt_tokens: int) -> list[dict]:
+def _truncate_messages(messages: list[dict], max_prompt_tokens: int, model=None) -> list[dict]:
+    """Truncate messages to fit within max_prompt_tokens.
+    model param ensures token counting uses the correct tokenizer (important when
+    main model and think model have different vocabularies).
+    """
+    count = lambda m: _count_tokens(m, model)
+
     system = [m for m in messages if m["role"] == "system"]
     rest = [m for m in messages if m["role"] != "system"]
 
-    system_tokens = sum(_count_tokens(m) for m in system)
-    counts = [_count_tokens(m) for m in rest]
+    system_tokens = sum(count(m) for m in system)
+    counts = [count(m) for m in rest]
     total = system_tokens + sum(counts)
 
     dropped: list[dict] = []
@@ -67,7 +74,6 @@ def _truncate_messages(messages: list[dict], max_prompt_tokens: int) -> list[dic
     if not dropped:
         return system + rest
 
-    # Insert a compressed summary of dropped messages so the model stays oriented
     lines = [f"[{len(dropped)} earlier messages were compressed to fit context]"]
     for m in dropped:
         preview = m["content"][:120].replace("\n", " ")
@@ -84,7 +90,7 @@ def chat(messages: list[dict], on_token=None) -> dict:
     # Reserve ~25% of context for response; at minimum 2048 tokens
     n_ctx = _model.n_ctx()
     max_prompt_tokens = max(512, n_ctx - max(2048, n_ctx // 4) - 64)
-    messages = _truncate_messages(messages, max_prompt_tokens)
+    messages = _truncate_messages(messages, max_prompt_tokens, model=_model)
 
     t0 = time.time()
 
@@ -152,8 +158,7 @@ def think_chat(messages: list[dict], on_token=None) -> dict:
 
     n_ctx = model.n_ctx()
     max_prompt_tokens = max(512, n_ctx - max(2048, n_ctx // 4) - 64)
-    # reuse token counting against _model for simplicity
-    messages = _truncate_messages(messages, max_prompt_tokens)
+    messages = _truncate_messages(messages, max_prompt_tokens, model=model)
 
     t0 = time.time()
 
@@ -218,11 +223,15 @@ def stop():
 
 
 def estimate_context_usage(messages: list[dict]) -> tuple[int, int]:
-    """Returns (used_tokens, max_tokens). Both 0 if model not loaded."""
+    """Returns (used_tokens, max_tokens) after applying the same truncation that
+    chat() would apply — so the percentage reflects what actually reaches the model."""
     if _model is None:
         return 0, 0
-    used = sum(_count_tokens(m) for m in messages)
-    return used, _model.n_ctx()
+    n_ctx = _model.n_ctx()
+    max_prompt = max(512, n_ctx - max(2048, n_ctx // 4) - 64)
+    effective = _truncate_messages(messages, max_prompt, model=_model)
+    used = sum(_count_tokens(m, _model) for m in effective)
+    return used, n_ctx
 
 
 def benchmark() -> float:

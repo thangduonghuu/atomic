@@ -177,9 +177,8 @@ def backup_file(path: str) -> None:
     if not os.path.exists(real):
         return
     os.makedirs(BACKUP_DIR, exist_ok=True)
-    import time
-    stamp = int(time.time() * 1000)
-    backup_name = f"{stamp}_{os.path.basename(real)}"
+    import uuid
+    backup_name = f"{uuid.uuid4().hex[:16]}_{os.path.basename(real)}"
     backup_path = os.path.join(BACKUP_DIR, backup_name)
     shutil.copy2(real, backup_path)
 
