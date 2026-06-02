@@ -12,6 +12,33 @@ HF_API = "https://huggingface.co/api/models/{repo_id}"
 HF_DOWNLOAD = "https://huggingface.co/{repo_id}/resolve/main/{filename}"
 DOWNLOAD_DIR = os.path.expanduser("~/Documents/models")
 
+QUANT_LABELS: dict[str, tuple[str, str]] = {
+    "q2_k":   ("Q2_K",   "very compressed, noticeable quality loss"),
+    "q3_k_m": ("Q3_K_M", "small, some quality loss"),
+    "q3_k_s": ("Q3_K_S", "small, some quality loss"),
+    "q4_0":   ("Q4_0",   "fast, good for low-RAM machines"),
+    "q4_k_m": ("Q4_K_M", "best balance of size and quality"),
+    "q4_k_s": ("Q4_K_S", "slightly smaller than Q4_K_M"),
+    "q5_k_m": ("Q5_K_M", "high quality, needs more RAM"),
+    "q5_k_s": ("Q5_K_S", "high quality, slightly smaller"),
+    "q5_0":   ("Q5_0",   "high quality, older format"),
+    "q6_k":   ("Q6_K",   "very high quality, ~6 bits/weight"),
+    "q8_0":   ("Q8_0",   "near-lossless, largest GGUF size"),
+    "f16":    ("F16",    "full precision, very large"),
+    "f32":    ("F32",    "full precision, very large"),
+}
+
+RECOMMENDED_QUANTS = {"q4_k_m", "q5_k_m"}
+
+
+def _quant_info(filename: str) -> tuple[str, str, bool]:
+    """Returns (label, description, is_recommended) parsed from a GGUF filename."""
+    lower = filename.lower()
+    for key, (label, desc) in QUANT_LABELS.items():
+        if key in lower:
+            return label, desc, key in RECOMMENDED_QUANTS
+    return "", "", False
+
 
 def fetch_gguf_files(repo_id: str) -> list[dict]:
     url = HF_API.format(repo_id=repo_id)
@@ -85,8 +112,11 @@ def interactive_download(repo_id: str | None = None) -> str:
     console.print(f"\n  GGUF files in [cyan]{repo_id}[/cyan]:\n")
     for i, f in enumerate(files):
         size = f.get("size", 0)
-        size_str = f"  ({size / 1e9:.1f} GB)" if size else ""
-        console.print(f"    [{i + 1}] {f['rfilename']}[dim]{size_str}[/dim]")
+        size_str = f"  {size / 1e9:.1f} GB" if size else ""
+        label, desc, is_rec = _quant_info(f["rfilename"])
+        quant_str = f"  [cyan]{label}[/cyan] [dim]— {desc}[/dim]" if label else ""
+        rec_str = "  [green bold]★ recommended[/green bold]" if is_rec else ""
+        console.print(f"    [{i + 1}] {f['rfilename']}[dim]{size_str}[/dim]{quant_str}{rec_str}")
 
     console.print()
     while True:

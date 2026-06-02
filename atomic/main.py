@@ -13,6 +13,7 @@ from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.rule import Rule
+from rich.table import Table
 from rich.text import Text
 
 from atomic import llm, tools, model_picker
@@ -22,6 +23,8 @@ console = Console()
 _session_written: list[tuple[str, str]] = []  # (path, "created"|"modified")
 
 DIFF_COLLAPSE_THRESHOLD = 40
+AGENT_MAX_STEPS = 20
+HISTORY_FILE = os.path.expanduser("~/.atomic/history")
 
 EXT_TO_LANG = {
     ".py": "python", ".js": "javascript", ".ts": "typescript",
@@ -35,12 +38,17 @@ EXT_TO_LANG = {
 TOOL_READ    = re.compile(r'<read_file\s+path=["\']([^"\']+)["\']')
 TOOL_LIST    = re.compile(r'<list_dir\s+path=["\']([^"\']+)["\']')
 TOOL_WRITE   = re.compile(r'<write_file\s+path=["\']([^"\']+)["\']\s*>(.*?)</write_file>', re.DOTALL)
+TOOL_EDIT    = re.compile(r'<edit_file\s+path=["\']([^"\']+)["\']\s*>\s*<old>(.*?)</old>\s*<new>(.*?)</new>\s*</edit_file>', re.DOTALL)
+TOOL_GREP    = re.compile(r'<grep_file\s+pattern=["\']([^"\']+)["\']\s*(?:path=["\']([^"\']+)["\'])?\s*/?>')
+TOOL_GIT     = re.compile(r'<git\s+cmd=["\']([^"\']+)["\']\s*/?>')
 CREATE_NOTE  = re.compile(r'<create_note\s+path=["\']([^"\']+)["\']\s*>(.*?)</create_note>', re.DOTALL)
 CODE_BLOCK   = re.compile(r'```(bash|sh|shell|python|py|bash-server)\n(.*?)```', re.DOTALL)
 THINK_BLOCK  = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 AGENT_DONE   = re.compile(r'<done>(.*?)</done>', re.DOTALL)
 _AGENT_STRIP = re.compile(
-    r'<(?:list_dir|read_file)\s[^>]*/?>|<write_file\s[^>]*>.*?</write_file>|<done>.*?</done>',
+    r'<(?:list_dir|read_file|grep_file|git)\s[^>]*/?>|'
+    r'<(?:write_file|edit_file|create_note)\s[^>]*>.*?</(?:write_file|edit_file|create_note)>|'
+    r'<done>.*?</done>',
     re.DOTALL,
 )
 
@@ -157,22 +165,18 @@ def _flush_server_output() -> None:
 
 def get_input() -> str:
     w = shutil.get_terminal_size().columns
-    border = f"[dim]{'─' * w}[/dim]"
-    console.print(border)
+    console.print(f"[dim]{'─' * w}[/dim]")
     try:
-        line = input(" > ")
+        line = input("  \033[36m◆\033[0m  ")
     except KeyboardInterrupt:
         print()
         raise
-    console.print(border)
     return line.strip()
 
 
 
 SYSTEM_PROMPT = """You are a local coding assistant with direct filesystem access on this machine.
 Current working directory: {cwd}
-
-You have the following tools. Use them freely — never say you cannot access files.
 
 TOOLS:
 
@@ -182,59 +186,56 @@ TOOLS:
 2. Read a file:
    <read_file path="src/app.py"/>
 
-3. Write (create or overwrite) a file — use this instead of bash heredocs:
+3. Search for a pattern across files (use BEFORE reading to locate code):
+   <grep_file pattern="def process_payment" path="src/"/>
+   <grep_file pattern="import requests"/>
+
+4. Surgical edit — preferred for changing existing files:
+   <edit_file path="src/app.py">
+   <old>
+   def foo():
+       pass
+   </old>
+   <new>
+   def foo():
+       return 42
+   </new>
+   </edit_file>
+   The <old> block must be an exact copy of the current file content (including whitespace).
+   Use write_file only for NEW files or complete rewrites.
+
+5. Write/overwrite a full file (new files or complete rewrites only):
    <write_file path="src/app.py">
    full file content here
    </write_file>
-   IMPORTANT: When fixing or editing an existing file, ALWAYS use <write_file> — never show the corrected code in a markdown block. The user will be shown a diff and asked to confirm before the file is written.
 
-4. Run a one-time shell command (auto-executed — must exit on its own):
+6. Read git state (use at the start to understand what's already changed):
+   <git cmd="status"/>
+   <git cmd="diff"/>
+   <git cmd="log --oneline -10"/>
+
+7. Run a one-time shell command (auto-executed):
    ```bash
    command here
    ```
-   Each bash block is an independent subprocess. Chain commands with && if order matters.
 
-5. Show a long-running command the user must start manually (NOT auto-executed):
+8. Long-running server command (NOT auto-executed):
    ```bash-server
-   command here
+   npm run dev
    ```
-   Use this for anything that runs forever: dev servers, watchers, repls, etc.
-   The system will display it but tell the user to run it in a separate terminal.
 
-6. Create a work note — a markdown planning document saved to disk:
+9. Create a planning note:
    <create_note path=".notes/plan.md">
-   # Plan: Feature Name
-   ...
+   content
    </create_note>
-   Use this when a task is complex enough to warrant a written plan. Prefer .notes/ as the directory.
 
 WORKFLOW:
-- Explore with <list_dir> and <read_file> to understand the codebase.
-- Create or edit files with <write_file>.
-- Use ```bash``` for install, build, test, scaffold — commands that finish and exit.
-- Use ```bash-server``` for start/serve/watch commands that stay running.
-- After each tool result, continue until the task is complete.
-
-EXAMPLES:
-User: what files are here?
-Assistant: <list_dir path="."/>
-
-User: show me main.py
-Assistant: <read_file path="main.py"/>
-
-User: create a hello world script
-Assistant: <write_file path="hello.py">
-print("Hello, world!")
-</write_file>
-
-User: set up a react app with vite
-Assistant: ```bash
-npm create vite@latest . -- --template react && npm install
-```
-Now start the dev server:
-```bash-server
-npm run dev
-```"""
+1. Check git state with <git cmd="status"/> to see what's already modified.
+2. Use <grep_file> to locate relevant code before reading full files.
+3. Read specific files with <read_file>.
+4. Edit existing files with <edit_file>. Create new files with <write_file>.
+5. Run tests or build with ```bash```.
+6. Never show corrected code in a markdown block — always use edit_file or write_file."""
 
 
 THINK_SYSTEM_PROMPT = """You are a deep-thinking software investigator. Your job is to thoroughly understand a problem and produce a structured, actionable work note.
@@ -281,48 +282,162 @@ WORKFLOW:
 AGENT_SYSTEM_PROMPT = """You are an autonomous coding agent with direct filesystem access.
 Current working directory: {cwd}
 
-Your job: receive a task, plan it, then implement it fully — step by step — without waiting for the user between steps.
+Your job: receive a task, plan it, then implement it fully — step by step — without waiting for the user.
 
 TOOLS:
 
-1. List directory:
-   <list_dir path="."/>
-
-2. Read file:
-   <read_file path="src/app.py"/>
-
-3. Write/overwrite file (user sees diff and confirms before it is written):
-   <write_file path="src/app.py">
-   full file content here
-   </write_file>
-   Always read a file before writing it.
-
-4. Run a shell command (auto-executed, must exit on its own):
-   ```bash
-   command here
-   ```
-
-5. Signal task completion:
-   <done>Brief summary of what was accomplished.</done>
+1. <list_dir path="."/>
+2. <read_file path="src/app.py"/>
+3. <grep_file pattern="className" path="src/"/>   ← find code before reading full files
+4. <edit_file path="src/app.py">                  ← preferred for editing existing files
+   <old>exact current content</old>
+   <new>replacement content</new>
+   </edit_file>
+5. <write_file path="new_file.py">content</write_file>   ← new files or full rewrites only
+6. <git cmd="status"/>  |  <git cmd="diff"/>  |  <git cmd="log --oneline -10"/>
+7. ```bash\ncommand\n```   ← one-time commands (auto-executed)
+8. <done>Summary of what was accomplished.</done>
 
 WORKFLOW:
-1. Explore with <list_dir> and <read_file> to understand the relevant code.
-2. Narrate your plan briefly, then execute step by step.
-3. After each tool result, continue with the next step — do not stop to ask questions.
-4. Verify changes when sensible (run tests, build, grep, etc.).
-5. End every run with <done>summary</done> once the task is complete.
+1. Run <git cmd="status"/> to see what's already changed.
+2. Use <grep_file> to locate relevant code, then <read_file> to read it.
+3. Make changes with <edit_file> (existing files) or <write_file> (new files).
+4. Verify with ```bash``` (tests, build, lint).
+5. End with <done>summary</done>.
 
 RULES:
-- Make reasonable decisions and proceed — do not ask the user for clarification.
-- Use <write_file> for ALL file edits; never output corrected code as a plain markdown block.
-- Each ```bash``` block is an independent subprocess; use && to chain dependent commands.
+- Never output corrected code in markdown — always use edit_file or write_file.
+- edit_file <old> must be an exact copy from the file including whitespace.
+- Each ```bash``` is an independent subprocess; chain with && when order matters.
+- Make decisions and proceed — do not stop to ask questions.
 """
+
+
+def _detect_test_cmd() -> str | None:
+    """Return the test command for the current project, or None."""
+    cwd = os.getcwd()
+    if any(os.path.exists(os.path.join(cwd, f)) for f in ("pytest.ini", "setup.cfg", "pyproject.toml", "setup.py")):
+        return "python3 -m pytest -x -q 2>&1 | tail -20"
+    if os.path.exists(os.path.join(cwd, "package.json")):
+        try:
+            import json as _j
+            with open(os.path.join(cwd, "package.json")) as f:
+                pkg = _j.load(f)
+            if "test" in pkg.get("scripts", {}):
+                return "npm test"
+        except Exception:
+            pass
+    if os.path.exists(os.path.join(cwd, "go.mod")):
+        return "go test ./... 2>&1 | tail -20"
+    if os.path.exists(os.path.join(cwd, "Cargo.toml")):
+        return "cargo test 2>&1 | tail -20"
+    return None
+
+
+def _run_tests_after_agent() -> None:
+    """Offer to run project tests after agent completes."""
+    cmd = _detect_test_cmd()
+    if not cmd:
+        return
+    try:
+        ans = input(f"  Run tests? [Y/n] > ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if ans in ("n", "no"):
+        return
+    console.print(f"  [dim]running tests...[/dim]")
+    result = tools.run_script(cmd, "bash")
+    if result["ok"]:
+        console.print(f"  [green]✓ tests passed[/green]\n")
+    else:
+        console.print(f"  [red]✗ tests failed[/red]\n{result['output']}\n")
+
+
+def _offer_git_commit(summary: str) -> None:
+    """Offer to git commit changes made by the agent."""
+    import subprocess
+    try:
+        r = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True, cwd=os.getcwd(), timeout=5)
+    except Exception:
+        return
+    if not r.stdout.strip():
+        return
+    try:
+        ans = input("  Commit changes? [y/N] > ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if ans not in ("y", "yes"):
+        return
+    msg = f"agent: {summary[:72]}"
+    subprocess.run(["git", "add", "-A"], cwd=os.getcwd())
+    r = subprocess.run(["git", "commit", "-m", msg], capture_output=True, text=True, cwd=os.getcwd())
+    if r.returncode == 0:
+        console.print(f"  [green]✓ committed:[/green] [dim]{msg}[/dim]\n")
+    else:
+        console.print(f"  [red]commit failed:[/red] {r.stderr.strip()}\n")
+
+
+def _load_project_instructions() -> str | None:
+    for name in (".atomic/instructions.md", ".atomic.md"):
+        p = os.path.join(os.getcwd(), name)
+        if os.path.exists(p):
+            try:
+                with open(p) as f:
+                    return f.read().strip()
+            except Exception:
+                pass
+    return None
+
+
+def _apply_edit_confirmed(path: str, old_text: str, new_text: str) -> str:
+    """Show diff, ask confirmation, then apply surgical edit. Returns result message."""
+    ok, new_content, err = tools.apply_edit(path, old_text, new_text)
+    if not ok:
+        return err
+    if _print_diff(path, new_content):
+        tools.backup_file(path)
+        result = tools.write_file(path, new_content)
+        _session_written.append((path, "modified"))
+        return result
+    return f"User rejected edit to {path}."
+
+
+def _print_banner(model_name: str, tps: float, model_gb: float, avail_gb: float) -> None:
+    speed_color = "green" if tps > 25 else "yellow" if tps > 10 else "red"
+    speed_str = f"[{speed_color}]{tps:.0f} tok/s[/{speed_color}]" if tps > 0 else "[dim]—[/dim]"
+
+    ram_str = ""
+    if model_gb > 0 and avail_gb > 0:
+        warn = model_gb > avail_gb * 0.9
+        ram_color = "red" if warn else "dim"
+        ram_str = f"  [{ram_color}]{model_gb:.1f} GB model / {avail_gb:.1f} GB free[/{ram_color}]"
+    elif model_gb > 0:
+        ram_str = f"  [dim]{model_gb:.1f} GB[/dim]"
+
+    t = Table.grid(padding=(0, 2))
+    t.add_column(style="dim", width=7)
+    t.add_column()
+    t.add_row("model", f"[cyan]{model_name}[/cyan]")
+    t.add_row("speed", speed_str + ram_str)
+    t.add_row("dir", f"[dim]{os.getcwd()}[/dim]")
+
+    console.print(Panel(
+        t,
+        title="[bold cyan]◆ atomic[/bold cyan]",
+        subtitle="[dim]/agent  /think  /read  /undo  /model  /help[/dim]",
+        border_style="cyan",
+        padding=(1, 2),
+    ))
 
 
 def make_history() -> list[dict]:
     dir_listing = tools.list_dir(".")
+    system = SYSTEM_PROMPT.format(cwd=os.getcwd())
+    instructions = _load_project_instructions()
+    if instructions:
+        system += f"\n\n---\nPROJECT INSTRUCTIONS:\n{instructions}"
     return [
-        {"role": "system", "content": SYSTEM_PROMPT.format(cwd=os.getcwd())},
+        {"role": "system", "content": system},
         {"role": "user", "content": f"FYI, current directory contains:\n{dir_listing}"},
         {"role": "assistant", "content": "Got it, I can see the files in your current directory."},
     ]
@@ -465,12 +580,27 @@ def process_tool_calls(response: str, history: list[dict]) -> tuple[str, dict]:
             else:
                 tool_results.append(f"Could not read {path}.")
 
+        for pattern, path in TOOL_GREP.findall(response):
+            search_path = path or "."
+            console.print(f"  [dim]⚙ grep '{pattern}' in {search_path}[/dim]")
+            tool_results.append(tools.grep_files(pattern, search_path))
+
+        for cmd in TOOL_GIT.findall(response):
+            console.print(f"  [dim]⚙ git {cmd}[/dim]")
+            tool_results.append(f"git {cmd}:\n{tools.git_run(cmd)}")
+
+        for path, old_text, new_text in TOOL_EDIT.findall(response):
+            console.print(f"  [dim]⚙ editing {path}[/dim]")
+            result_msg = _apply_edit_confirmed(path, old_text.strip("\n"), new_text.strip("\n"))
+            tool_results.append(result_msg)
+
         for path, content in TOOL_WRITE.findall(response):
             stripped = content.lstrip("\n")
             real = os.path.join(os.getcwd(), path)
             is_new = not os.path.exists(real)
             console.print(f"  [dim]⚙ writing {path}[/dim]")
             if _print_diff(path, stripped):
+                tools.backup_file(path)
                 result_msg = tools.write_file(path, stripped)
                 _session_written.append((path, "created" if is_new else "modified"))
             else:
@@ -703,7 +833,12 @@ def _run_agent(task: str) -> None:
     step = 0
     while True:
         step += 1
-        console.print(f"[dim]  ── step {step} ──[/dim]")
+        if step > AGENT_MAX_STEPS:
+            console.print(f"\n  [yellow]⚠ reached {AGENT_MAX_STEPS}-step limit — start a new /agent task to continue[/yellow]\n")
+            break
+        remaining = AGENT_MAX_STEPS - step
+        step_color = "green" if remaining > 10 else "yellow" if remaining > 5 else "red"
+        console.print(f"\n[dim]  ── step [/dim][bold]{step}[/bold][dim]/{AGENT_MAX_STEPS}  [/dim][{step_color}][dim]{remaining} left[/dim][/{step_color}]")
 
         reply, result = _stream_chat(history)
         if reply is None:
@@ -727,6 +862,8 @@ def _run_agent(task: str) -> None:
             summary = done_match.group(1).strip()
             console.print(f"\n[green]  ◉ done:[/green] {summary}\n")
             _notify_telegram(f"atomic agent done ✓\n{summary}")
+            _run_tests_after_agent()
+            _offer_git_commit(summary)
             break
 
         tool_results: list[str] = []
@@ -742,11 +879,25 @@ def _run_agent(task: str) -> None:
                 f"Contents of {path}:\n```\n{content}\n```" if content else f"Could not read {path}."
             )
 
+        for pattern, path in TOOL_GREP.findall(reply):
+            search_path = path or "."
+            console.print(f"  [dim]⚙ grep '{pattern}' in {search_path}[/dim]")
+            tool_results.append(tools.grep_files(pattern, search_path))
+
+        for cmd in TOOL_GIT.findall(reply):
+            console.print(f"  [dim]⚙ git {cmd}[/dim]")
+            tool_results.append(f"git {cmd}:\n{tools.git_run(cmd)}")
+
+        for path, old_text, new_text in TOOL_EDIT.findall(reply):
+            console.print(f"  [dim]⚙ editing {path}[/dim]")
+            tool_results.append(_apply_edit_confirmed(path, old_text.strip("\n"), new_text.strip("\n")))
+
         for path, content in TOOL_WRITE.findall(reply):
             stripped = content.lstrip("\n")
             real = os.path.join(os.getcwd(), path)
             is_new = not os.path.exists(real)
             if _print_diff(path, stripped):
+                tools.backup_file(path)
                 result_msg = tools.write_file(path, stripped)
                 _session_written.append((path, "created" if is_new else "modified"))
             else:
@@ -861,6 +1012,8 @@ def _respond(history: list[dict]) -> str | None:
     ctx_used, ctx_max = llm.estimate_context_usage(history)
     ctx_info = f"  ctx {ctx_used:,}/{ctx_max:,}" if ctx_max else ""
     console.print(f"\n[dim]  ⏱ {elapsed:.1f}s · {comp} tok · {tps:.0f} tok/s{ctx_info}[/dim]")
+    if ctx_max and ctx_used / ctx_max > 0.80:
+        console.print(f"  [yellow]⚠ context {ctx_used / ctx_max:.0%} full — /clear to reset[/yellow]")
     return reply
 
 
@@ -880,11 +1033,30 @@ def _save_conversation(history: list[dict], path: str) -> None:
         console.print(f"  [red]Failed to save: {e}[/red]\n")
 
 
+def _save_history() -> None:
+    try:
+        os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
+        readline.write_history_file(HISTORY_FILE)
+    except Exception:
+        pass
+
+
 def run():
     global _script_session_allowed
     from atomic import config as cfg_mod
 
+    try:
+        readline.read_history_file(HISTORY_FILE)
+        readline.set_history_length(500)
+    except FileNotFoundError:
+        pass
+
     model_path = model_picker.pick_model()
+
+    model_gb, avail_gb = llm.check_ram(model_path)
+    if avail_gb > 0 and model_gb > avail_gb * 0.9:
+        console.print(f"\n  [yellow]⚠ model is {model_gb:.1f} GB but only {avail_gb:.1f} GB RAM free — may be slow[/yellow]")
+
     console.print(f"\n  [dim]Loading model...[/dim]", end="\r")
     llm.load_model(model_path)
 
@@ -892,8 +1064,12 @@ def run():
     if think_path and os.path.exists(think_path):
         llm.load_think_model(think_path)
 
+    console.print(f"  [dim]Benchmarking...      [/dim]", end="\r")
+    tps = llm.benchmark()
+
     model_name = os.path.basename(model_path)
-    console.print(Rule(f"[cyan]atomic[/cyan]  [dim]{model_name}[/dim]"))
+    console.print(" " * 30 + "\r", end="")
+    _print_banner(model_name, tps, model_gb, avail_gb)
 
     history = make_history()
 
@@ -904,6 +1080,7 @@ def run():
         except EOFError:
             llm.stop()
             _print_session_summary()
+            _save_history()
             console.print("\n[dim]bye.[/dim]")
             break
         except KeyboardInterrupt:
@@ -916,6 +1093,7 @@ def run():
         if user_input in ("/exit", "/quit"):
             llm.stop()
             _print_session_summary()
+            _save_history()
             console.print("[dim]bye.[/dim]")
             break
 
@@ -926,32 +1104,44 @@ def run():
                 console.print("  [dim]no server running[/dim]\n")
             continue
 
+        if user_input == "/undo":
+            result = tools.undo_last_write()
+            if result:
+                original, _ = result
+                console.print(f"  [green]↩ restored[/green] [cyan]{original}[/cyan]\n")
+            else:
+                console.print("  [dim]nothing to undo[/dim]\n")
+            continue
+
         if user_input == "/clear":
             _print_session_summary()
             _session_written.clear()
             console.clear()
-            console.print(Rule(f"[cyan]atomic[/cyan]  [dim]{model_name}[/dim]"))
+            _print_banner(model_name, 0.0, 0.0, 0.0)
             history = make_history()
             _script_session_allowed = None
             _write_session_allowed = None
             continue
 
         if user_input == "/help":
-            console.print("""
-  [bold]Commands:[/bold]
-
-  [cyan]/agent <task>[/cyan]         Autonomous agent: plans and implements the task
-  [cyan]/think <prompt>[/cyan]       Deep investigation → saves a work note
-  [cyan]/telegram[/cyan]             Set up Telegram notifications
-  [cyan]/read <path>[/cyan]          Load a file into context
-  [cyan]/model[/cyan]                Switch main model mid-session
-  [cyan]/think-model[/cyan]          Set the thinking model
-  [cyan]/server[/cyan]               Stop the background server
-  [cyan]/save [path][/cyan]          Save conversation to a markdown file
-  [cyan]/clear[/cyan]                Reset conversation history
-  [cyan]/help[/cyan]                 Show this help
-  [cyan]/exit[/cyan], [cyan]/quit[/cyan]        Exit
-""")
+            t = Table(show_header=False, box=None, padding=(0, 3))
+            t.add_column(style="cyan", no_wrap=True)
+            t.add_column(style="dim")
+            for cmd, desc in [
+                ("/agent <task>",   "autonomous agent — plans and implements end-to-end"),
+                ("/think <prompt>", "deep investigation → saves a work note to .notes/"),
+                ("/read <path>",    "load a file or directory into context"),
+                ("/undo",           "restore the last file changed by the AI"),
+                ("/telegram",       "configure Telegram notifications"),
+                ("/model",          "switch main model mid-session"),
+                ("/think-model",    "set the thinking model"),
+                ("/server",         "stop the background dev server"),
+                ("/save [path]",    "save conversation to a markdown file"),
+                ("/clear",          "reset conversation history"),
+                ("/exit",           "quit"),
+            ]:
+                t.add_row(cmd, desc)
+            console.print(Panel(t, title="[bold]commands[/bold]", border_style="dim", padding=(1, 2)))
             continue
 
         if user_input.startswith("/save"):
@@ -1000,12 +1190,22 @@ def run():
 
         if user_input.startswith("/read "):
             path = user_input[6:].strip()
-            content = tools.read_file(path)
-            if content is None:
-                continue
-            history.append({"role": "user", "content": f"Please review this file ({path}):\n```\n{content}\n```"})
+            if os.path.isdir(path):
+                files = tools.read_dir(path)
+                if not files:
+                    console.print(f"  [dim]no readable files found in {path}[/dim]\n")
+                    continue
+                console.print(f"  [dim]loading {len(files)} files from {path}[/dim]")
+                parts = [f"File: {p}\n```\n{c}\n```" for p, c in files]
+                history.append({"role": "user", "content": f"Please review these files from {path}:\n\n" + "\n\n".join(parts)})
+            else:
+                content = tools.read_file(path)
+                if content is None:
+                    continue
+                history.append({"role": "user", "content": f"Please review this file ({path}):\n```\n{content}\n```"})
         elif any(kw in user_input.lower() for kw in ("project", "directory", "code", "review", "check", "bug", "fix", "error", "issue")):
             listing = tools.list_dir(".")
+            console.print("  [dim]↳ injecting directory context[/dim]")
             history.append({"role": "user", "content": f"{user_input}\n\n[Current directory files:\n{listing}]"})
         else:
             history.append({"role": "user", "content": user_input})
@@ -1117,13 +1317,44 @@ def _run_agent_serve(task: str, token: str, chat_id: str) -> None:
                 f"Contents of {path}:\n```\n{content}\n```" if content else f"Could not read {path}."
             )
 
+        for pattern, path in TOOL_GREP.findall(reply):
+            tool_results.append(tools.grep_files(pattern, path or "."))
+
+        for cmd in TOOL_GIT.findall(reply):
+            tool_results.append(f"git {cmd}:\n{tools.git_run(cmd)}")
+
+        for path, old_text, new_text in TOOL_EDIT.findall(reply):
+            ok, new_content, err = tools.apply_edit(path, old_text.strip("\n"), new_text.strip("\n"))
+            if ok:
+                tools.backup_file(path)
+                result_msg = tools.write_file(path, new_content)
+                _session_written.append((path, "modified"))
+                send(f"Edited: {path}")
+            else:
+                result_msg = err
+            tool_results.append(result_msg)
+
         for path, content in TOOL_WRITE.findall(reply):
             stripped = content.lstrip("\n")
             real = os.path.join(os.getcwd(), path)
             is_new = not os.path.exists(real)
+            if is_new:
+                diff_info = f" ({len(stripped.splitlines())} lines)"
+            else:
+                try:
+                    with open(real, "r", errors="replace") as _fh:
+                        _old = _fh.read().splitlines(keepends=True)
+                    _new = stripped.splitlines(keepends=True)
+                    _diff = list(difflib.unified_diff(_old, _new))
+                    _added = sum(1 for l in _diff if l.startswith("+") and not l.startswith("+++"))
+                    _removed = sum(1 for l in _diff if l.startswith("-") and not l.startswith("---"))
+                    diff_info = f" (+{_added} -{_removed} lines)"
+                except Exception:
+                    diff_info = ""
+            send(f"{'Creating' if is_new else 'Modifying'}: {path}{diff_info}")
+            tools.backup_file(path)
             result_msg = tools.write_file(path, stripped)
             _session_written.append((path, "created" if is_new else "modified"))
-            send(f"{'Created' if is_new else 'Modified'}: {path}")
             tool_results.append(result_msg)
 
         for match in CODE_BLOCK.finditer(reply):
@@ -1158,6 +1389,58 @@ def _run_agent_serve(task: str, token: str, chat_id: str) -> None:
         history.append({"role": "user", "content": "\n\n".join(tool_results)})
 
 
+def _run_chat_serve(text: str, token: str, chat_id: str, history: list[dict]) -> None:
+    """Handle a regular chat message in serve mode, maintaining conversation history."""
+
+    def send(msg: str):
+        _tg_send(token, chat_id, msg)
+
+    if any(kw in text.lower() for kw in ("project", "directory", "code", "review", "check", "bug", "fix", "error", "issue")):
+        listing = tools.list_dir(".")
+        history.append({"role": "user", "content": f"{text}\n\n[Current directory files:\n{listing}]"})
+    else:
+        history.append({"role": "user", "content": text})
+
+    try:
+        result = llm.chat(history)
+        reply = result["content"]
+    except Exception as e:
+        send(f"Error: {e}")
+        return
+
+    # process tool calls (read/list/write)
+    while True:
+        tool_results = []
+        for path in TOOL_LIST.findall(reply):
+            tool_results.append(f"Directory listing of {path}:\n{tools.list_dir(path)}")
+        for path in TOOL_READ.findall(reply):
+            content = tools.read_file(path)
+            tool_results.append(f"Contents of {path}:\n```\n{content}\n```" if content else f"Could not read {path}.")
+        for path, content in TOOL_WRITE.findall(reply):
+            result_msg = tools.write_file(path, content.lstrip("\n"))
+            send(f"Modified: {path}")
+            tool_results.append(result_msg)
+        if not tool_results:
+            break
+        history.append({"role": "assistant", "content": reply})
+        history.append({"role": "user", "content": "\n\n".join(tool_results)})
+        try:
+            result = llm.chat(history)
+            reply = result["content"]
+        except Exception as e:
+            send(f"Error: {e}")
+            return
+
+    think_match = THINK_BLOCK.search(reply)
+    if think_match:
+        reply = THINK_BLOCK.sub("", reply).strip()
+
+    display = _AGENT_STRIP.sub("", reply).strip()
+    if display:
+        send(display[:4096])
+    history.append({"role": "assistant", "content": reply})
+
+
 def _serve() -> None:
     from atomic import config as cfg_mod
 
@@ -1173,6 +1456,7 @@ def _serve() -> None:
     token = tg["token"]
     chat_id = tg["chat_id"]
     cwd = os.getcwd()
+    _serve_start = time.time()
 
     model_path = model_picker.pick_model()
     console.print("  [dim]Loading model...[/dim]", end="\r")
@@ -1182,10 +1466,14 @@ def _serve() -> None:
     console.print(f"  [dim]dir: {cwd}[/dim]")
     console.print(f"  [dim]Listening on Telegram... Ctrl+C to stop.[/dim]\n")
 
-    _tg_send(token, chat_id, f"atomic online ✓\nModel: {model_name}\nDir: {cwd}\n\nSend me a task.")
+    _tg_send(token, chat_id, (
+        f"atomic online ✓\nModel: {model_name}\nDir: {cwd}\n\n"
+        "Send me a question or use /agent <task> for autonomous coding."
+    ))
 
     # Use a queue so model inference always runs on the main thread (llama-cpp is not thread-safe)
     task_queue: queue.Queue = queue.Queue()
+    chat_history: list[dict] = make_history()
 
     def poll_loop():
         offset = 0
@@ -1216,12 +1504,42 @@ def _serve() -> None:
     try:
         while True:
             try:
-                task = task_queue.get(timeout=1)
+                text = task_queue.get(timeout=1)
             except queue.Empty:
                 continue
-            console.print(f"[dim]  ← {task[:80]}[/dim]")
+            console.print(f"[dim]  ← {text[:80]}[/dim]")
             try:
-                _run_agent_serve(task, token, chat_id)
+                if text.startswith("/agent "):
+                    task = text[7:].strip()
+                    if task:
+                        _run_agent_serve(task, token, chat_id)
+                    else:
+                        _tg_send(token, chat_id, "Usage: /agent <task description>")
+                elif text == "/clear":
+                    chat_history.clear()
+                    chat_history.extend(make_history())
+                    _tg_send(token, chat_id, "Conversation cleared.")
+                elif text == "/status":
+                    uptime_s = int(time.time() - _serve_start)
+                    h, m = divmod(uptime_s // 60, 60)
+                    uptime_str = f"{h}h {m}m" if h else f"{m}m"
+                    _tg_send(token, chat_id, (
+                        f"✓ online\n"
+                        f"Model: {llm.get_model_name()}\n"
+                        f"Dir: {cwd}\n"
+                        f"Uptime: {uptime_str}"
+                    ))
+                elif text == "/help":
+                    _tg_send(token, chat_id, (
+                        "Commands:\n"
+                        "/agent <task> — autonomous coding agent\n"
+                        "/status — show model, dir, uptime\n"
+                        "/clear — reset conversation\n"
+                        "/help — show this help\n\n"
+                        "Or just ask me anything."
+                    ))
+                else:
+                    _run_chat_serve(text, token, chat_id, chat_history)
             except Exception as e:
                 _tg_send(token, chat_id, f"Error: {e}")
                 console.print(f"[red]  task error: {e}[/red]")

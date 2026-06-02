@@ -12,11 +12,27 @@ DEFAULT_SEARCH_DIRS = [
 ]
 
 
+_DEFAULT_CONFIG: dict = {"default_model": None, "recent_models": []}
+
+
 def load() -> dict:
-    if os.path.exists(CONFIG_FILE):
+    if not os.path.exists(CONFIG_FILE):
+        return dict(_DEFAULT_CONFIG)
+    try:
         with open(CONFIG_FILE) as f:
-            return json.load(f)
-    return {"default_model": None, "recent_models": []}
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("config root is not an object")
+        return data
+    except Exception as e:
+        import shutil, sys
+        backup = CONFIG_FILE + ".bak"
+        try:
+            shutil.copy2(CONFIG_FILE, backup)
+        except Exception:
+            pass
+        print(f"  [warning] Config corrupted ({e}) — reset to defaults. Backup: {backup}", file=sys.stderr)
+        return dict(_DEFAULT_CONFIG)
 
 
 def save(cfg: dict):

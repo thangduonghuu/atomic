@@ -1,185 +1,263 @@
 # atomic
 
-Local-first CLI coding assistant powered by any GGUF model via llama-cpp-python. No API keys, no data leaves your machine.
+> A fully offline, privacy-first CLI coding agent powered by local GGUF models.  
+> No API keys. No data leaves your machine.
+
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
+![License MIT](https://img.shields.io/badge/license-MIT-green)
+![Platform macOS Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
+
+---
+
+## Why atomic?
+
+Most AI coding tools send your code to a remote server. atomic runs entirely on your hardware — the model, the file system access, everything. It is designed for developers who work in air-gapped environments, care about code privacy, or simply want a capable coding agent that works offline.
+
+The standout feature: **`atomic serve`** — an always-on agent you control via Telegram. Text your machine a task from your phone, get step-by-step updates, and receive a notification when it's done.
+
+---
 
 ## Features
 
-- **Fully offline** — runs entirely on your machine using a local GGUF model
-- **Autonomous agent** — `/agent` mode: model plans and implements a task end-to-end, looping through read → edit → run → verify until done
-- **Change suggestions** — file edits show a syntax-highlighted diff and require confirmation before writing
-- **Smart script execution** — auto-runs bash/python commands; failed scripts are auto-fixed and retried (up to 3 attempts)
-- **Deep investigation** — `/think` mode uses a second model to explore the codebase and produce a structured work note
-- **Background server** — dev servers run in the background, output streams to terminal, chat stays usable
-- **Server detection** — if a server accidentally lands in a `bash` block, atomic detects and moves it to background automatically
-- **Interruptible** — Ctrl+C stops thinking or a running script without exiting; Ctrl+D to quit
-- **Context-aware** — injects current directory listing so you can say "review my code" without specifying paths
-- **Model management** — download from HuggingFace, register local files, switch models mid-session
+### Agent & Reasoning
+- **Autonomous agent** (`/agent`) — plans and implements a task end-to-end: searches code, reads files, writes edits, runs commands, verifies results, and signals completion
+- **Deep investigation** (`/think`) — uses a dedicated thinking model to explore the codebase and produce a structured work note saved to `.notes/`
+- **Step limit with visual counter** — agent shows `step 3/20 · 17 left`, warns and stops gracefully at the limit
+
+### Code Intelligence
+- **Grep tool** — model searches across files before reading them (`<grep_file pattern="..." path="..."/>`)
+- **Surgical edits** — model edits exact lines rather than overwriting entire files (`<edit_file>`)
+- **Git awareness** — model reads `git status`, `git diff`, `git log` before making changes
+- **Auto-run tests** — after agent completes, detects `pytest` / `npm test` / `go test` / `cargo test` and offers to run
+- **Auto-commit** — after a successful task, offers to `git commit` with an auto-generated message
+
+### Safety & Control
+- **Diff before every write** — syntax-highlighted diff shown; requires `[y]es / [n]o / [a]lways` before any file is touched
+- **`/undo`** — restores the last AI-written file from a 20-deep backup history
+- **Script auto-fix** — failed bash/python scripts are sent back to the model for fixing, retried up to 3 times
+- **Binary file guard** — skips binary files automatically, never injects garbage into context
+- **`.atomicignore`** — exclude `node_modules`, `venv`, `.git`, etc. from context (defaults sensible out of the box)
+
+### Remote Control
+- **Telegram serve mode** (`atomic serve`) — always-on agent; send tasks via Telegram, receive step-by-step replies
+- **Telegram notifications** — `/agent` and `/think` send a message on completion
+- **`/status` command** (in serve mode) — reply with current model, directory, and uptime
+
+### Developer Experience
+- **Project memory** — place instructions in `.atomic/instructions.md`; injected into every session automatically
+- **`/read <path>`** — load a file or an entire directory into context
+- **Command history** — persisted across sessions (`↑` to recall previous commands)
+- **Context warnings** — warns at 80% context usage; summarizes dropped messages instead of silently deleting them
+- **Background server** — dev servers run in the background; atomic detects when a command never exits and moves it automatically
+- **Model benchmark** — measures and displays `tok/s` after loading so you know what to expect
 
 ---
 
-## Setup
-
-### 1. Clone the repo
+## Installation
 
 ```bash
-git clone https://github.com/thangduonghuu/atomic
-cd atomic
+git clone https://github.com/thangduonghuu/atomic && cd atomic && ./install.sh
 ```
 
-### 2. Create a virtual environment (recommended)
+The installer auto-detects your GPU and configures the build accordingly:
 
-```bash
-python3 -m venv venv
-source venv/bin/activate
-```
+| Platform | Acceleration |
+|---|---|
+| macOS | Apple Metal (automatic) |
+| Linux + NVIDIA | CUDA (automatic) |
+| Everything else | CPU |
 
-### 3. Install llama-cpp-python
+Everything is installed to `~/.atomic/`. An `atomic` command is added to your PATH — no virtual environment activation needed.
 
-**Mac — Metal GPU acceleration:**
-```bash
-CMAKE_ARGS="-DGGML_METAL=on" pip install llama-cpp-python
-```
-
-**Linux — CUDA:**
-```bash
-CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python
-```
-
-**CPU only:**
-```bash
-pip install llama-cpp-python
-```
-
-### 4. Install atomic
-
-```bash
-pip install -e .
-```
+**Requirements:** Python 3.10+
 
 ---
 
-## Download a model
+## Quickstart
 
-Any GGUF model from [HuggingFace](https://huggingface.co/models?library=gguf) works. Recommended starting point: [Qwen2.5-Coder-7B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF).
-
-**Interactive (recommended):**
 ```bash
+# 1. Install
+git clone https://github.com/thangduonghuu/atomic && cd atomic && ./install.sh
+
+# 2. Download a model
 atomic model download
-```
-This opens an interactive prompt to search and download any GGUF model from HuggingFace.
 
-**Direct repo:**
-```bash
-atomic model download Qwen/Qwen2.5-Coder-7B-Instruct-GGUF
-```
-
-**Register a model you already have:**
-```bash
-atomic model add ~/models/qwen2.5-coder-7b-instruct-q4_k_m.gguf
-```
-
-The selected model is saved as default for future runs.
-
----
-
-## Run
-
-```bash
+# 3. Start
 atomic
 ```
 
-On first run, atomic prompts you to pick or download a model.
+On first run, atomic prompts you to pick or download a model. The interactive downloader labels each quantization level and marks the recommended choice.
 
 ---
 
-## CLI Commands
+## Model Management
+
+```bash
+atomic model download                          # Interactive — browse & download from HuggingFace
+atomic model download Qwen/Qwen2.5-Coder-7B-Instruct-GGUF  # Direct repo
+atomic model add ~/models/my-model.gguf       # Register a local file
+atomic model list                             # List available models
+atomic model                                  # Re-select default
+```
+
+**Recommended starting point:** [Qwen2.5-Coder-7B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF) — good balance of speed and code quality on consumer hardware.
+
+The downloader shows each file's size, quantization description, and a `★ recommended` marker for the best quality/size tradeoff (`Q4_K_M` or `Q5_K_M`).
+
+---
+
+## CLI Reference
 
 ```
-atomic                        Start chat
-atomic serve                  Listen on Telegram 24/7 (long-poll agent)
-atomic model                  Re-select default model
-atomic model list             List available models
-atomic model add <path>       Register a local .gguf file
-atomic model download [repo]  Download from HuggingFace
-atomic help                   Show help
+atomic                         Start chat
+atomic serve                   Always-on Telegram agent
+atomic model                   Re-select default model
+atomic model list              List available models
+atomic model add <path>        Register a local .gguf file
+atomic model download [repo]   Download from HuggingFace
+atomic help                    Show help
 ```
+
+---
 
 ## Chat Commands
 
 | Command | Description |
 |---|---|
 | `/agent <task>` | Autonomous agent — plans and implements the task end-to-end |
-| `/think <prompt>` | Deep investigation using a thinking model → saves a work note |
-| `/telegram` | Set up Telegram notifications |
-| `/read <path>` | Load a file into context |
+| `/think <prompt>` | Deep investigation → saves a structured work note to `.notes/` |
+| `/read <path>` | Load a file or directory into context |
+| `/undo` | Restore the last file changed by the AI |
+| `/telegram` | Configure Telegram notifications |
 | `/model` | Switch main model mid-session |
-| `/think-model` | Set the thinking model |
-| `/server` | Stop the background server |
+| `/think-model` | Set the dedicated thinking model |
+| `/server` | Stop the background dev server |
 | `/save [path]` | Save conversation to a markdown file |
 | `/clear` | Reset conversation history |
-| `/exit` or `/quit` | Quit |
+| `/help` | Show command reference |
+| `/exit` | Quit |
 
-### Agent mode
+---
 
-`/agent` runs an autonomous loop where the model plans and executes the task without waiting for input between steps:
+## Agent Mode
+
+`/agent` runs an autonomous loop: the model plans, reads files, searches code, writes edits, runs commands, and verifies results without waiting for input.
 
 ```
-/agent add unit tests for the tools module
-/agent refactor the script runner to support a configurable timeout
-/agent fix the bug where an empty diff still triggers a write
+/agent add unit tests for the auth module
+/agent refactor the database layer to use connection pooling
+/agent fix the bug where empty diffs still trigger a write confirmation
 ```
 
-The agent reads files, writes edits (still shows diff + asks confirmation), runs bash commands, checks results, and keeps going until it signals completion with `<done>`.
+After completion, atomic offers to:
+1. Run your project's test suite
+2. Commit the changes with an auto-generated message
 
-### Think mode
+File writes always show a diff and require confirmation — even in agent mode.
 
-`/think` sends the task to a dedicated thinking model for deep investigation. It explores the codebase and produces a structured plan saved to `.notes/`. Useful before a large refactor or when debugging a subtle issue.
+---
 
-Set a different model for thinking:
+## Think Mode
+
+`/think` sends the task to a dedicated reasoning model that explores the codebase and produces a structured plan:
+
+```
+/think the payment flow has a race condition — investigate and plan a fix
+/think we need to add multi-tenancy — what needs to change?
+```
+
+Output is saved to `.notes/` as a markdown document with Problem, Investigation, Approach, and Step-by-step sections. Useful before a large refactor or when debugging a subtle issue.
+
+To use a different (larger) model for thinking:
+
 ```
 /think-model
 ```
 
-### Telegram notifications & serve mode
+---
 
-Two ways to use Telegram:
+## Telegram Integration
 
-**Session mode** — run tasks in the terminal, get notified when done:
-- `/agent` and `/think` automatically send a Telegram message on completion
+### Notifications (session mode)
+Run tasks in your terminal — get a Telegram message when `/agent` or `/think` finishes.
 
-**Serve mode** — always-on agent that listens for tasks via Telegram:
+### Serve mode (remote agent)
 ```bash
 atomic serve
 ```
-Send any message to the bot → agent runs and replies with step-by-step updates. File writes are auto-accepted (no terminal to confirm).
+Keeps the agent running 24/7. Send any message to your bot and it executes as an agent task, sending step-by-step updates back to you.
 
-**Setup (required for both modes):**
+**Telegram commands in serve mode:**
+
+| Command | Description |
+|---|---|
+| `/agent <task>` | Run an autonomous agent task |
+| `/status` | Show model, working directory, and uptime |
+| `/clear` | Reset conversation history |
+| `/help` | Show available commands |
+
+**Setup:**
 1. Create a bot via [@BotFather](https://t.me/BotFather) and copy the token
 2. Send any message to your new bot
-3. Run `/telegram` inside atomic — it fetches your chat ID automatically and sends a test message
+3. Run `/telegram` inside atomic — it auto-fetches your chat ID and sends a test message
+
+---
+
+## Project Memory
+
+Create `.atomic/instructions.md` in your project root to give the model persistent context about your codebase:
+
+```markdown
+# Project instructions
+
+- This is a Django 4.2 project using PostgreSQL
+- Always use `ruff` for linting before committing
+- Test files live in `tests/` and use `pytest`
+- Never modify `migrations/` directly — use `manage.py makemigrations`
+```
+
+This file is automatically injected into every session's system prompt.
+
+---
+
+## Ignoring Files
+
+Create `.atomicignore` in your project root to exclude paths from directory context:
+
+```
+node_modules
+venv
+dist
+build
+*.lock
+*.env
+```
+
+Defaults (applied when no `.atomicignore` exists): `node_modules`, `venv`, `.git`, `__pycache__`, `dist`, `build`, `.next`, `*.lock`.
+
+---
 
 ## Keyboard Shortcuts
 
 | Key | Effect |
 |---|---|
 | `Enter` | Submit message |
-| `Ctrl+C` | Cancel current input / interrupt thinking / kill running script |
-| `Ctrl+D` | Exit app |
+| `↑ / ↓` | Navigate command history |
+| `Ctrl+C` | Cancel input / interrupt generation / kill running script |
+| `Ctrl+D` | Exit |
 
 ---
 
-## How script execution works
+## How Script Execution Works
 
 The model uses two block types:
 
 | Block | Behaviour |
 |---|---|
-| ` ```bash ` | Auto-executed — one-time commands (install, build, test, scaffold) |
-| ` ```bash-server ` | Starts in background — dev servers, watchers, long-running processes |
+| ` ```bash ` | Auto-executed — one-time commands (install, build, test) |
+| ` ```bash-server ` | Runs in background — dev servers, watchers, long-running processes |
 
-If the model puts a server command in a `bash` block, atomic detects it at runtime (goes silent for 5s while still running) and moves it to background automatically.
-
-Server output streams to the terminal prefixed with `│ [srv]`. Use `/server` to stop it.
+If a server command ends up in a `bash` block, atomic detects it (silent for 5s while still running) and moves it to background automatically. Server output streams to the terminal prefixed with `│ [srv]`.
 
 ---
 
@@ -187,14 +265,16 @@ Server output streams to the terminal prefixed with `│ [srv]`. Use `/server` t
 
 ```
 atomic/
-├── main.py          # CLI entry, chat loop, script execution
-├── llm.py           # llama-cpp-python wrapper, context truncation
-├── tools.py         # read_file, list_dir, run_script, background server
-├── permissions.py   # file access permission gate
-├── model_picker.py  # interactive model selection
-├── download.py      # HuggingFace model downloader
-└── config.py        # saved config (~/.config/atomic/)
+├── main.py          # CLI entry point, chat loop, agent loop, UI
+├── llm.py           # llama-cpp-python wrapper, context management, benchmark
+├── tools.py         # File I/O, grep, git, script execution, undo, background server
+├── permissions.py   # File access permission gate
+├── model_picker.py  # Interactive model selection
+├── download.py      # HuggingFace model downloader with quantization labels
+└── config.py        # Persistent config (~/.atomic/config.json)
 ```
+
+---
 
 ## License
 
